@@ -79,16 +79,6 @@ Status TensorHandle::Tensor(const tensorflow::Tensor** t) {
   return Status::OK();
 }
 
-Status TensorHandle::Device(tensorflow::Device** d) {
-  *d = device_;
-  return Status::OK();
-}
-
-Status TensorHandle::OpDevice(tensorflow::Device** d) {
-  *d = op_device_;
-  return Status::OK();
-}
-
 Status TensorHandle::TensorAndDevice(const tensorflow::Tensor** tensor,
                                      tensorflow::Device** device,
                                      tensorflow::Device** op_device) {
@@ -194,10 +184,7 @@ Status TensorHandle::CopyToDevice(EagerContext* ctx, tensorflow::Device* dstd,
   bool is_same_device = (srcd == dstd) || (srcd->name() == dstd->name());
   const bool dst_cpu = dstd->tensorflow_gpu_device_info() == nullptr;
   const bool src_cpu = srcd->tensorflow_gpu_device_info() == nullptr;
-  // both_on_cpu can be true and yet is_same_device is false, if one of src/dst
-  // has device type XLA_CPU, and the other CPU.
-  const bool both_on_cpu = src_cpu && dst_cpu;
-  if (is_same_device || both_on_cpu) {
+  if (is_same_device) {
     *output = new tensorflow::TensorHandle(*src, dstd, dstd, ctx);
     return tensorflow::Status::OK();
   }

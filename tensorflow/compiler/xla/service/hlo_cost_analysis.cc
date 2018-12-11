@@ -419,6 +419,21 @@ Status HloCostAnalysis::HandleTranspose(const HloInstruction*) {
 }
 
 Status HloCostAnalysis::HandleAfterAll(const HloInstruction*) {
+  // This instruction is used to enforce ordering at compile time. No code is
+  // emitted.
+  current_should_compute_bottleneck_time_ = false;
+  current_properties_[kBytesAccessedKey] = 0;
+  current_properties_[kOptimalSecondsKey] = 0;
+  return Status::OK();
+}
+
+Status HloCostAnalysis::HandleAddDependency(
+    const HloInstruction* add_dependency) {
+  // This instruction is used to enforce ordering at compile time. No code is
+  // emitted.
+  current_should_compute_bottleneck_time_ = false;
+  current_properties_[kBytesAccessedKey] = 0;
+  current_properties_[kOptimalSecondsKey] = 0;
   return Status::OK();
 }
 
@@ -687,6 +702,11 @@ Status HloCostAnalysis::HandleScatter(const HloInstruction* scatter) {
       current_properties_[property.first] = property.second * element_count;
     }
   }
+  return Status::OK();
+}
+
+Status HloCostAnalysis::HandleGetDimensionSize(
+    const HloInstruction* /*get_size*/) {
   return Status::OK();
 }
 

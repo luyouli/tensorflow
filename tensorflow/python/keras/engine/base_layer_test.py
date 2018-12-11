@@ -81,14 +81,14 @@ class BaseLayerTest(test.TestCase):
     inputs = keras.Input((3,))
     outputs = DynamicLayer1()(inputs)
     model = keras.Model(inputs, outputs)
-    self.assertEqual(model._is_static_graph_friendly, False)
+    self.assertEqual(model._static_graph_friendly, False)
     model.compile(RMSPropOptimizer(0.001), loss='mse')
     model.train_on_batch(np.random.random((2, 3)), np.random.random((2, 3)))
 
     inputs = keras.Input((3,))
     outputs = DynamicLayer2()(inputs)
     model = keras.Model(inputs, outputs)
-    self.assertEqual(model._is_static_graph_friendly, False)
+    self.assertEqual(model._static_graph_friendly, False)
     model.compile(RMSPropOptimizer(0.001), loss='mse')
     model.train_on_batch(np.random.random((2, 3)), np.random.random((2, 3)))
 
@@ -102,7 +102,7 @@ class BaseLayerTest(test.TestCase):
     outputs = inner_model(x)
 
     model = keras.Model(inputs, outputs)
-    self.assertEqual(model._is_static_graph_friendly, False)
+    self.assertEqual(model._static_graph_friendly, False)
     model.compile(RMSPropOptimizer(0.001), loss='mse')
     model.train_on_batch(np.random.random((2, 3)), np.random.random((2, 3)))
 
@@ -116,7 +116,7 @@ class BaseLayerTest(test.TestCase):
     inputs = keras.Input((3,))
     outputs = InvalidLayer()(inputs)
     model = keras.Model(inputs, outputs)
-    self.assertEqual(model._is_static_graph_friendly, False)
+    self.assertEqual(model._static_graph_friendly, False)
     model.compile(RMSPropOptimizer(0.001), loss='mse')
     with self.assertRaisesRegexp(ValueError, 'You did something wrong!'):
       model.train_on_batch(np.random.random((2, 3)), np.random.random((2, 3)))
@@ -167,19 +167,26 @@ class BaseLayerTest(test.TestCase):
   def test_mixing_keras_symbolic_tensors_and_eager_tensors(self):
     x1 = keras.Input((3,))
     x2 = array_ops.ones((3, 3))
-    with self.assertRaisesRegexp(
-        TypeError,
-        'mix computation of symbolic Tensors'):
-      math_ops.matmul(x1, x2)
+    y = math_ops.matmul(x1, x2)
+    self.assertEqual(y.graph, keras.backend.get_graph())
+    fn = keras.backend.function(inputs=[x1], outputs=[y])
+    x_val = np.random.random((3, 3))
+    y_val = np.ones((3, 3))
+    self.assertAllClose(fn([x_val])[0],
+                        np.matmul(x_val, y_val),
+                        atol=1e-5)
 
   def test_mixing_keras_symbolic_tensors_and_numpy_arrays(self):
-    # For the time being we treat Numpy arrays as EagerTensors when mixing both.
     x1 = keras.Input((3,))
     x2 = np.ones((3, 3), dtype='float32')
-    with self.assertRaisesRegexp(
-        TypeError,
-        'mix computation of symbolic Tensors'):
-      math_ops.matmul(x1, x2)
+    y = math_ops.matmul(x1, x2)
+    self.assertEqual(y.graph, keras.backend.get_graph())
+    fn = keras.backend.function(inputs=[x1], outputs=[y])
+    x_val = np.random.random((3, 3))
+    y_val = np.ones((3, 3))
+    self.assertAllClose(fn([x_val])[0],
+                        np.matmul(x_val, y_val),
+                        atol=1e-5)
 
 
 if __name__ == '__main__':

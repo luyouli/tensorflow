@@ -218,6 +218,21 @@ class BinaryOpsTest(xla_test.XLATestCase):
             ],
             equality_test=self.ListsAreClose)
 
+      # TF doesn't define these for bf16.
+      if dtype != dtypes.bfloat16.as_numpy_dtype:
+        self._testBinary(
+            gen_math_ops.xdivy,
+            np.array([0, 4, 3, 2, 1, 0], dtype=dtype),
+            np.array([0, 5, 6, 7, 8, float("NaN")], dtype=dtype),
+            expected=np.array([0, 0.8, 0.5, 0.285714, 0.125, 0], dtype=dtype))
+
+        self._testBinary(
+            gen_math_ops.xlogy,
+            np.array([0, 4, 3, 2, 1, 0], dtype=dtype),
+            np.array([0, 5, 6, 7, 8, float("NaN")], dtype=dtype),
+            expected=np.array([0, 6.437752, 5.375278, 3.89182, 2.079442, 0],
+                              dtype=dtype))
+
   def testIntOps(self):
     for dtype in self.signed_int_types:
       self._testBinary(
@@ -969,7 +984,7 @@ class BinaryOpsTest(xla_test.XLATestCase):
       self._testBinary(
           array_ops.expand_dims,
           np.array([42], dtype=dtype),
-          np.int32(0),
+          np.array([0], dtype=np.int64),
           expected=np.array([[42]], dtype=dtype))
       self._testBinary(
           array_ops.expand_dims,
@@ -996,6 +1011,11 @@ class BinaryOpsTest(xla_test.XLATestCase):
           np.array([[[1, 2], [3, 4]]], dtype=dtype),
           np.int32(3),
           expected=np.array([[[[1], [2]], [[3], [4]]]], dtype=dtype))
+      self._testBinary(
+          array_ops.expand_dims,
+          np.array([[[1, 2], [3, 4]]], dtype=dtype),
+          np.array([2], dtype=np.int64),
+          expected=np.array([[[[1, 2]], [[3, 4]]]], dtype=dtype))
 
   def testPad(self):
     for dtype, pad_type in itertools.product(

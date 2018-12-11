@@ -103,8 +103,8 @@ py_test(
     srcs = ["python/saved_model/keras_saved_model_test.py"],
     srcs_version = "PY2AND3",
     tags = [
+        "no_oss",  # TODO(b/119349471): Re-enable
         "no_windows",
-        "notsan",
     ],
     deps = [
         ":keras_saved_model",
