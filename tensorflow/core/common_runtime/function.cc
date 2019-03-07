@@ -104,6 +104,10 @@ static Node* AddIdentity(Graph* g, Endpoint input) {
   NodeDef ndef;
   ndef.set_name(g->NewName(kNodeLabel));
   ndef.set_op("Identity");
+  // NOTE(skyewm): we explicitly set the device here to address a multi-GPU
+  // performance issue where this Identity would be placed alone on a GPU,
+  // causing unnecessary device traffic. See b/122483225 for details.
+  ndef.set_device(input.node->def().device());
   ndef.add_input(input.name());
   AddNodeAttr("T", BaseType(input.dtype()), &ndef);
   Status s;
@@ -188,6 +192,7 @@ class FunctionLibraryRuntimeOverlay : public FunctionLibraryRuntime {
 
   Env* env() override;
   Device* device() override;
+  std::function<void(std::function<void()>)>* runner() override;
   const DeviceMgr* device_mgr() const override;
 
   string DebugString(Handle handle) override;
@@ -262,6 +267,11 @@ Env* FunctionLibraryRuntimeOverlay::env() { return base_flr_->env(); }
 
 Device* FunctionLibraryRuntimeOverlay::device() { return base_flr_->device(); }
 
+std::function<void(std::function<void()>)>*
+FunctionLibraryRuntimeOverlay::runner() {
+  return base_flr_->runner();
+}
+
 const DeviceMgr* FunctionLibraryRuntimeOverlay::device_mgr() const {
   return base_flr_->device_mgr();
 }
@@ -329,6 +339,11 @@ class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
   }
 
   Device* device() override { return device_; }
+
+  std::function<void(std::function<void()>)>* runner() override {
+    return &default_runner_;
+  }
+
   const DeviceMgr* device_mgr() const override { return device_mgr_; }
   Env* env() override { return env_; }
   int graph_def_version() override { return graph_def_version_; }
@@ -453,7 +468,9 @@ class CallOp : public AsyncOpKernel {
   CallOp(FunctionLibraryRuntime::Handle handle, OpKernelConstruction* ctx)
       : AsyncOpKernel(ctx), handle_(handle) {}
 
-  ~CallOp() override {}
+  ~CallOp() override {
+    // TODO(iga): Release the cached handle_
+  }
 
   void ComputeAsync(OpKernelContext* ctx, DoneCallback done) override {
     FunctionLibraryRuntime* lib = ctx->function_library();
@@ -628,11 +645,20 @@ bool FunctionLibraryRuntimeImpl::IsLocalTarget(
     const InstantiateOptions& options) {
   if (device_ == nullptr) return true;
   if (options.target.empty()) return true;
+  if (options.is_multi_device_function) return false;
   Device* target_device;
   if (!device_mgr_->LookupDevice(options.target, &target_device).ok()) {
+    VLOG(1) << "Not instantiating function in FLR because failed to "
+            << "find device " << options.target << " in device manager";
     return false;
   }
-  return target_device == device_;
+  if (target_device != device_) {
+    VLOG(1) << "Not instantiating function in FLR because target device "
+            << options.target
+            << " is different from FLR's device: " << device_->DebugString();
+    return false;
+  }
+  return true;
 }
 
 Status FunctionLibraryRuntimeImpl::Instantiate(
@@ -669,7 +695,6 @@ Status FunctionLibraryRuntimeImpl::Instantiate(
     }
   }
 
-  Status s;
   const FunctionLibraryDefinition* lib_def =
       options.overlay_lib ? options.overlay_lib : base_lib_def_;
   FunctionBody* fbody = nullptr;
@@ -732,15 +757,32 @@ Status FunctionLibraryRuntimeImpl::ReleaseHandle(Handle handle) {
   if (h == kInvalidLocalHandle) {
     return parent_->ReleaseHandle(handle);
   }
-  mutex_lock l(mu_);
-  CHECK_EQ(1, items_.count(h));
-  std::unique_ptr<Item>& item = items_[h];
-  --item->instantiation_counter;
-  if (item->instantiation_counter == 0) {
-    items_.erase(h);
-    TF_RETURN_IF_ERROR(parent_->RemoveHandle(handle));
+
+  std::unique_ptr<Item> item_to_delete;
+  Status parent_status;
+  {
+    mutex_lock l(mu_);
+    auto it = items_.find(h);
+    if (it == items_.end()) {
+      return errors::Internal(
+          "Inconsistent FunctionLibraryRuntime. Expected to find an item for "
+          "handle ",
+          h, " but found none");
+    }
+    std::unique_ptr<Item>& item = it->second;
+    --item->instantiation_counter;
+    if (item->instantiation_counter == 0) {
+      // We don't simply erase h's item because that would trigger
+      // item destruction while holding mu_. Item destruction can
+      // trigger graph destruction. If the graph contains kernels like
+      // CallOp or PartitionCallOp, their destructors will release cached
+      // function handles, resulting in deadlock here.
+      item_to_delete = std::move(item);
+      items_.erase(h);
+      parent_status = parent_->RemoveHandle(handle);
+    }
   }
-  return Status::OK();
+  return parent_status;
 }
 
 void DumpGraph(StringPiece label, const Graph* g) {
@@ -754,23 +796,41 @@ void DumpGraph(StringPiece label, const Graph* g) {
   }
 }
 
-void OptimizeGraph(FunctionLibraryRuntime* lib, std::unique_ptr<Graph>* g) {
+void OptimizeGraph(FunctionLibraryRuntime* lib, std::unique_ptr<Graph>* g,
+                   const GraphOptimizer::Options& graph_optimizer_options) {
   OptimizerOptions opts;
   opts.set_do_common_subexpression_elimination(true);
   opts.set_do_function_inlining(true);
   opts.set_do_constant_folding(true);
   GraphOptimizer optimizer(opts);
-  optimizer.Optimize(lib, lib->env(), lib->device(), g, /*shape_map=*/nullptr);
+  optimizer.Optimize(lib, lib->env(), lib->device(), g,
+                     graph_optimizer_options);
+}
+
+void OptimizeGraph(FunctionLibraryRuntime* lib, std::unique_ptr<Graph>* g) {
+  OptimizeGraph(lib, g, GraphOptimizer::Options());
 }
 
 namespace {
 // Removes all stateless nodes that do not contribute to a return
-// value from the function body.  Unlike `RemoveDeadNodes()`, which is
+// value from the function body. Unlike `RemoveDeadNodes()`, which is
 // triggered by `OptimizerOptions.do_function_inlining`, this pass
 // ignores the SINK node, from which (by definition) all nodes are
-// reverse reachable.
-void PruneFunctionBody(Graph* g) {
-  VLOG(2) << "Pruning function body";
+// reverse reachable, and preserves all nodes that are reachable from
+// control output nodes.
+//
+// TODO(ezhulenev, skyewm): Function body should not have special treatment of
+// stateful ops, graph should encode nodes that must execute with `control_ret`
+// and `control_output`.
+void PruneFunctionBody(const FunctionDef& fdef, Graph* g) {
+  VLOG(2) << "Pruning function body: function_name=" << fdef.signature().name();
+
+  // `control_ret` nodes must be always executed.
+  std::unordered_set<StringPiece, StringPieceHasher> control_ret_nodes;
+  for (const auto& control_ret : fdef.control_ret()) {
+    control_ret_nodes.insert(control_ret.second);
+  }
+
   std::unordered_set<const Node*> nodes;
   for (auto n : g->nodes()) {
     // NOTE(mrry): "_Retval" nodes are stateful, and so will be added
@@ -781,7 +841,8 @@ void PruneFunctionBody(Graph* g) {
     // still needed. It would be preferable to prune entire loops and/or
     // conditionals if they are not used in the graph.
     if (n->IsControlFlow() ||
-        (n->op_def().is_stateful() && n->type_string() != kArgOp)) {
+        (n->op_def().is_stateful() && n->type_string() != kArgOp) ||
+        (control_ret_nodes.find(n->name()) != control_ret_nodes.end())) {
       nodes.insert(n);
     }
   }
@@ -808,7 +869,7 @@ Status FunctionLibraryRuntimeImpl::CreateItem(Item** item) {
   std::unique_ptr<Graph> g(new Graph(lib_def));
   CopyGraph(*fbody->graph, g.get());
 
-  PruneFunctionBody(g.get());
+  PruneFunctionBody(fbody->fdef, g.get());
   optimizer_.Optimize(this, env(), device(), &g, /*shape_map=*/nullptr);
   TF_RETURN_IF_ERROR(EnsureMemoryTypes(DeviceType(device()->device_type()),
                                        device()->name(), g.get()));
@@ -1339,41 +1400,79 @@ bool RemoveListArrayConverter(Graph* g) {
   return removed_any;
 }
 
-// Returns true iff the function '*fbody' can be inlined at 'node'
-// based on the type signature of 'node' and 'fbody'.
-static bool ValidateInlining(const Node* node, const FunctionBody* fbody) {
-  if (static_cast<size_t>(node->num_inputs()) != fbody->arg_types.size()) {
-    return false;
+namespace {
+
+Status ValidateNoInline(const FunctionBody* fbody) {
+  const auto attr = AttrSlice(&fbody->fdef.attr());
+  bool noinline = false;
+  if (GetNodeAttr(attr, kNoInlineAttr, &noinline).ok() && noinline) {
+    return errors::InvalidArgument(
+        "Can't inline function marked with '_noinline'");
   }
-  if (static_cast<size_t>(node->num_inputs()) != fbody->arg_nodes.size()) {
-    return false;
-  }
-  if (static_cast<size_t>(node->num_outputs()) != fbody->ret_types.size()) {
-    return false;
-  }
-  if (static_cast<size_t>(node->num_outputs()) != fbody->ret_nodes.size()) {
-    return false;
-  }
-  for (int i = 0; i < node->num_inputs(); ++i) {
-    if (node->input_type(i) != fbody->arg_types[i]) return false;
-  }
-  for (int i = 0; i < node->num_outputs(); ++i) {
-    if (node->output_type(i) != fbody->ret_types[i]) return false;
-  }
-  return true;
+  return Status::OK();
 }
 
-// Given a "caller" in graph "g", which is a function call of a function
-// to "fbody". Replaces the "caller" with fbody->graph and connects
-// edges properly. "override_device" specifies whether inlining should replace
-// explicitly specified devices inside fbody with the callee's device.
-void InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
-                        Node* caller, const FunctionBody* fbody,
-                        bool override_device) {
-  if (!ValidateInlining(caller, fbody)) {
-    LOG(WARNING) << "Inlining mismatch: " << caller->DebugString() << " vs. "
+}  // namespace
+
+Status ValidateInlining(const Node* node, const FunctionBody* fbody,
+                        const InlineFunctionBodyOptions& options) {
+  // TODO(ezhulenev): Currently common_runtime function inlining can't guarantee
+  // that all side-effectful ops will be executed after inlining. See Grappler
+  // function_optimizer for details. Unify all function inlining mechanism.
+  // Do not inline if `!fbody->control_ret_nodes.empty()`.
+
+  const auto num_node_inputs = static_cast<size_t>(node->num_inputs());
+  const auto num_node_outputs = static_cast<size_t>(node->num_outputs());
+
+  if (num_node_inputs != fbody->arg_types.size() ||
+      num_node_inputs != fbody->arg_nodes.size()) {
+    return errors::InvalidArgument(
+        "Node inputs do not match function arguments: inputs=", num_node_inputs,
+        " arg_types=", fbody->arg_types.size(),
+        " arg_nodes=", fbody->arg_nodes.size());
+  }
+
+  if (num_node_outputs != fbody->ret_types.size() ||
+      num_node_outputs != fbody->ret_nodes.size()) {
+    return errors::InvalidArgument(
+        "Node outputs do not match function returns: outputs=",
+        num_node_outputs, " ret_types=", fbody->ret_types.size(),
+        " ret_nodes=", fbody->ret_nodes.size());
+  }
+
+  for (int i = 0; i < node->num_inputs(); ++i) {
+    if (node->input_type(i) != fbody->arg_types[i]) {
+      return errors::InvalidArgument(
+          "Node input type doesn't match function argument type: ",
+          node->input_type(i), " != ", fbody->arg_types[i], " @ index=", i);
+    }
+  }
+  for (int i = 0; i < node->num_outputs(); ++i) {
+    if (node->output_type(i) != fbody->ret_types[i]) {
+      return errors::InvalidArgument(
+          "Node output type doesn't match function return type: ",
+          node->output_type(i), " != ", fbody->ret_types[i], " @ index=", i);
+    }
+  }
+
+  if (!options.ignore_noinline) {
+    TF_RETURN_IF_ERROR(ValidateNoInline(fbody));
+  }
+
+  return Status::OK();
+}
+
+Status InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
+                          Node* caller, const FunctionBody* fbody,
+                          const InlineFunctionBodyOptions& options) {
+  VLOG(3) << "Inline function call: " << SummarizeNode(*caller);
+  VLOG(4) << "Inlined function definition: " << DebugString(fbody->fdef);
+
+  Status validation = ValidateInlining(caller, fbody, options);
+  if (!validation.ok()) {
+    LOG(WARNING) << "Inlining mismatch: " << SummarizeNode(*caller) << " vs. "
                  << DebugString(fbody->graph);
-    return;
+    return errors::Internal("Inlining mismatch: ", validation.error_message());
   }
 
   // Input edges. For data edges coming into "caller", we first compute the
@@ -1386,6 +1485,7 @@ void InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
     if (e->IsControlEdge()) {
       if (input_control_node == nullptr) {
         input_control_node = AddNoOp(g);
+        input_control_node->set_requested_device(caller->def().device());
       }
       g->AddControlEdge(e->src(), input_control_node);
     } else {
@@ -1404,10 +1504,19 @@ void InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
   for (Node* n : fbody->graph->op_nodes()) {
     NodeDef ndef = n->def();
     ndef.set_name(strings::StrCat(caller->name(), "/", ndef.name()));
-    if (override_device || ndef.device().empty()) {
+    if (options.override_device || ndef.device().empty()) {
       ndef.set_device(caller->def().device());
     }
+    for (auto& attr : *ndef.mutable_attr()) {
+      if (attr.first == "_class") {
+        attr.second.set_s(
+            strings::StrCat(caller->name(), "/", attr.second.s()));
+      }
+    }
     Node* clone = g->AddNode(ndef, &s);
+    if (options.override_device && !caller->assigned_device_name().empty()) {
+      clone->set_assigned_device_name(caller->assigned_device_name());
+    }
     TF_CHECK_OK(s);
     node_map[n->id()] = clone;
 
@@ -1520,37 +1629,55 @@ void InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
     }
   }
   g->RemoveNode(caller);  // 'caller' is replaced with inlined nodes.
+
+  return Status::OK();
 }
 
-bool ExpandInlineFunctions(FunctionLibraryRuntime* lib, Graph* graph) {
+bool ExpandInlineFunctions(FunctionLibraryRuntime* lib, Graph* graph,
+                           const InlineFunctionBodyOptions& options) {
   std::vector<std::pair<Node*, const FunctionBody*>> candidates;
+
   const FunctionLibraryDefinition* fld = lib->GetFunctionLibraryDefinition();
+
   for (Node* node : graph->nodes()) {
-    VLOG(3) << "Expanding " << node->DebugString();
-    bool noinline;
-    if (fld->GetAttr(*node, kNoInlineAttr, &noinline).ok() && noinline) {
-      VLOG(3) << "noinline: " << node->DebugString();
+    // Skip nodes that are not function calls or SymbolicGradient calls.
+    if (fld->Find(node->type_string()) == nullptr &&
+        node->type_string() != FunctionLibraryDefinition::kGradientOp) {
       continue;
     }
+    // Skip function calls that marked noinline.
+    bool noinline;
+    if (fld->GetAttr(*node, kNoInlineAttr, &noinline).ok() && noinline) {
+      VLOG(3) << "noinline: " << SummarizeNode(*node);
+      continue;
+    }
+
     FunctionLibraryRuntime::Handle handle;
     Status s = lib->Instantiate(node->type_string(), node->attrs(), &handle);
     if (!s.ok()) {
-      // Either "node" is a primitive op, or the instantiation failed.
-      if (errors::IsNotFound(s)) {
-        VLOG(3) << "ExpandInlineFunctions " << s;
-      } else {
-        LOG(ERROR) << "ExpandInlineFunctions " << s;
-      }
+      LOG(ERROR) << "Failed to instantiate a function:  " << s.error_message();
       continue;
     }
     const FunctionBody* fbody = lib->GetFunctionBody(handle);
     CHECK_NOTNULL(fbody);
-    candidates.push_back({node, fbody});
+    candidates.emplace_back(node, fbody);
   }
+
+  bool inlined_any = false;
   for (const auto& p : candidates) {
-    InlineFunctionBody(*fld, graph, p.first, p.second);
+    Status inlined =
+        InlineFunctionBody(*fld, graph, p.first, p.second, options);
+    if (inlined.ok()) {
+      inlined_any = true;
+    } else {
+      VLOG(3) << "Failed to inline function call: node=" << p.first->name()
+              << " error=" << inlined.error_message();
+    }
   }
-  return !candidates.empty();
+
+  // TODO(ezhulenev): Release handles for inlined function calls.
+
+  return inlined_any;
 }
 
 string NewName(const Node* n, bool pretty) {
@@ -1586,6 +1713,13 @@ void ToGraphDef(const Graph* g, GraphDef* gdef, bool pretty) {
     for (const auto& attr : n->attrs()) {
       (*ndef->mutable_attr())[attr.first] = attr.second;
     }
+
+    if (!n->assigned_device_name().empty()) {
+      ndef->set_device(n->assigned_device_name());
+    } else {
+      ndef->set_device(n->requested_device());
+    }
+
     inputs.clear();
     inputs.resize(n->num_inputs());
     for (const Edge* e : n->in_edges()) {
@@ -1633,6 +1767,7 @@ FunctionBody::FunctionBody(const FunctionDef& f, DataTypeSlice arg_t,
       graph(g),
       arg_types(arg_t.begin(), arg_t.end()),
       ret_types(ret_t.begin(), ret_t.end()) {
+  // 1. Find regular Arg/Ret nodes.
   this->arg_nodes.resize(arg_types.size());
   this->ret_nodes.resize(ret_types.size());
   for (Node* n : this->graph->op_nodes()) {
@@ -1649,6 +1784,17 @@ FunctionBody::FunctionBody(const FunctionDef& f, DataTypeSlice arg_t,
     CHECK_LE(0, index);
     CHECK_LT(index, node_vec->size());
     (*node_vec)[index] = n;
+  }
+  // 2. Find ControlRet nodes that must be always executed.
+  std::unordered_set<StringPiece, StringPieceHasher> control_ret_node_names;
+  for (const auto& control_ret : fdef.control_ret()) {
+    control_ret_node_names.insert(control_ret.second);
+  }
+  this->control_ret_nodes.reserve(control_ret_node_names.size());
+  for (Node* n : this->graph->op_nodes()) {
+    if (control_ret_node_names.count(n->name()) > 0) {
+      this->control_ret_nodes.push_back(n);
+    }
   }
 }
 

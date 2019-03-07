@@ -523,10 +523,10 @@ XLA_TEST_F(FusionTest, DynamicSliceNegate) {
   auto const0 = builder.AddInstruction(HloInstruction::CreateConstant(
       LiteralUtil::CreateR1<int32>({1, 2, 3, 4})));
   auto const1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR1<int32>({1})));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<int32>(1)));
   auto dynamic_slice2 =
       builder.AddInstruction(HloInstruction::CreateDynamicSlice(
-          ShapeUtil::MakeShape(S32, {2}), const0, const1, {2}));
+          ShapeUtil::MakeShape(S32, {2}), const0, {const1}, {2}));
   auto negate3 = builder.AddInstruction(HloInstruction::CreateUnary(
       ShapeUtil::MakeShape(S32, {2}), HloOpcode::kNegate, dynamic_slice2));
   hlo_module->AddEntryComputation(builder.Build())
@@ -763,40 +763,6 @@ XLA_TEST_F(FusionTest, LesserOrEqual2D) {
 XLA_TEST_F(FusionTest, Clamp2D) {
   TestElementwise2D<float, 3>(HloOpcode::kClamp);
 }
-
-// TODO(b/117156505): Remove this test when the bug is fixed and the CPU backend
-// should not generate layout changing elementwise operations.
-#ifdef XLA_TEST_BACKEND_CPU
-XLA_TEST_F(FusionTest, LayoutChangingElementWiseOp) {
-  const string hlo_text = R"(
-HloModule Cluster
-
-fusion_c {
-  fusion.arg = f32[2,2]{1,0} parameter(0)
-  bitcast.0 = f32[2,2,1]{2,1,0} bitcast(fusion.arg)
-  tanh.0 = f32[2,2,1]{0,2,1} tanh(bitcast.0)
-  ROOT bitcast.2 = f32[2,2,1]{1,2,0} bitcast(tanh.0)
-}
-
-ENTRY main {
-  arg = f32[2,2]{1,0} parameter(0)
-  ROOT fusion = f32[2,2,1]{1,2,0} fusion(arg), kind=kLoop, calls=fusion_c
-}
-)";
-
-  Literal operand = LiteralUtil::CreateR2<float>({{0., 0.}, {1., 0.}});
-  HloModuleConfig config;
-  config.set_debug_options(GetDebugOptionsForTest());
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseHloString(hlo_text, config));
-  TF_ASSERT_OK_AND_ASSIGN(Literal result,
-                          test_runner_.Execute(std::move(module), {&operand},
-                                               /*run_hlo_passes=*/false));
-  EXPECT_TRUE(LiteralTestUtil::Equal(
-      LiteralUtil::CreateR3<float>({{{0.}, {0.76159415595}}, {{0.}, {0.}}}),
-      result));
-}
-#endif
 
 class FusionClientLibraryTest : public ClientLibraryTestBase {};
 

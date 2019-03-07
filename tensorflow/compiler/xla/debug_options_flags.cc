@@ -33,6 +33,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_cpu_multi_thread_eigen(true);
   opts.set_xla_gpu_cuda_data_dir("./cuda_sdk_lib");
   opts.set_xla_eliminate_hlo_implicit_broadcast(true);
+  opts.set_xla_hlo_dump_as_html(false);
 #ifdef INTEL_MKL
   opts.set_xla_cpu_use_mkl_dnn(true);
 #endif  // INTEL_MKL
@@ -127,24 +128,17 @@ static void AllocateFlags() {
       tensorflow::Flag(
           "xla_hlo_graph_path", flag_values->mutable_xla_hlo_graph_path(),
           "With xla_generate_hlo_graph, dump the graphs into this path."),
-      tensorflow::Flag(
-          "xla_hlo_dump_as_graphdef",
-          bool_setter_for(&DebugOptions::set_xla_hlo_dump_as_graphdef),
-          flag_values->xla_hlo_dump_as_graphdef(),
-          "Dump HLO graphs as TensorFlow GraphDefs."),
+      tensorflow::Flag("xla_hlo_dump_as_html",
+                       bool_setter_for(&DebugOptions::set_xla_hlo_dump_as_html),
+                       flag_values->xla_hlo_dump_as_html(),
+                       "Dump HLO graphs as an HTML (DOT rendered into SVG "
+                       "inlined in HTML)."),
       tensorflow::Flag(
           "xla_hlo_graph_sharding_color",
           bool_setter_for(&DebugOptions::set_xla_hlo_graph_sharding_color),
           flag_values->xla_hlo_graph_sharding_color(),
           "Assign colors based on sharding assignments when generating the "
           "HLO graphs."),
-      tensorflow::Flag(
-          "xla_hlo_tfgraph_device_scopes",
-          bool_setter_for(&DebugOptions::set_xla_hlo_tfgraph_device_scopes),
-          flag_values->xla_hlo_tfgraph_device_scopes(),
-          "When generating TensorFlow HLO graphs, if the HLO instructions "
-          "are assigned to a specific device, prefix the name scope with "
-          "\"devX\" with X being the device ordinal."),
       tensorflow::Flag(
           "xla_log_hlo_text", flag_values->mutable_xla_log_hlo_text(),
           "HLO modules matching this regex will be dumped to LOG(INFO)."),
@@ -201,6 +195,16 @@ static void AllocateFlags() {
           "Comma-separated list of hlo passes to be disabled. These names "
           "must exactly match the passes' names; no whitespace around "
           "commas."),
+      tensorflow::Flag(
+          "xla_disable_all_hlo_passes",
+          bool_setter_for(&DebugOptions::set_xla_disable_all_hlo_passes), false,
+          "Disables all HLO passes.  Notes that some passes are necessary for "
+          "correctness and the invariants that must be satisfied by 'fully "
+          "optimized' HLO are different for different devices and may change "
+          "over time.  The only 'guarantee', such as it is, is that if you "
+          "compile XLA and dump the optimized HLO for some graph, you should "
+          "be able to run it again on the same device with the same build of "
+          "XLA."),
       tensorflow::Flag(
           "xla_embed_ir_in_executable",
           bool_setter_for(&DebugOptions::set_xla_embed_ir_in_executable),
