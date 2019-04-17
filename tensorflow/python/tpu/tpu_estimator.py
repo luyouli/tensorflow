@@ -38,6 +38,7 @@ from tensorflow.core.protobuf.tpu import compilation_result_pb2 as tpu_compilati
 from tensorflow.python.client import session as tf_session
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.data.util import nest as data_nest
+from tensorflow.python.distribute.cluster_resolver import tpu_cluster_resolver
 from tensorflow.python.estimator import estimator as estimator_lib
 from tensorflow.python.estimator import model_fn as model_fn_lib
 from tensorflow.python.estimator.export import export_output as export_output_lib
@@ -62,6 +63,7 @@ from tensorflow.python.summary import summary
 from tensorflow.python.tpu import _tpu_estimator_embedding
 from tensorflow.python.tpu import error_handling
 from tensorflow.python.tpu import functional as tpu_functional
+from tensorflow.python.tpu import preempted_hook
 from tensorflow.python.tpu import session_support
 from tensorflow.python.tpu import tensor_tracer
 from tensorflow.python.tpu import tpu
@@ -113,11 +115,13 @@ _RESERVED_PARAMS_KEYS = [_BATCH_SIZE_KEY, _CTX_KEY]
 # explicitly).
 _WRAP_INPUT_FN_INTO_WHILE_LOOP = False
 
-ops.register_proto_function(
-    '{}_{}'.format(_TPU_ESTIMATOR, _ITERATIONS_PER_LOOP_VAR),
-    proto_type=variable_pb2.VariableDef,
-    to_proto=resource_variable_ops._to_proto_fn,  # pylint: disable=protected-access
-    from_proto=resource_variable_ops._from_proto_fn)  # pylint: disable=protected-access
+if ops.get_to_proto_function(
+    '{}_{}'.format(_TPU_ESTIMATOR, _ITERATIONS_PER_LOOP_VAR)) is None:
+  ops.register_proto_function(
+      '{}_{}'.format(_TPU_ESTIMATOR, _ITERATIONS_PER_LOOP_VAR),
+      proto_type=variable_pb2.VariableDef,
+      to_proto=resource_variable_ops._to_proto_fn,  # pylint: disable=protected-access
+      from_proto=resource_variable_ops._from_proto_fn)  # pylint: disable=protected-access
 
 
 def _is_iterable(obj):
@@ -251,6 +255,18 @@ def _extract_key_names(tensor_or_dict):
   if isinstance(tensor_or_dict, dict):
     return sorted(tensor_or_dict.keys())
   return []
+
+
+class PeriodicLogger(object):
+
+  def __init__(self, seconds):
+    self._log_every_n_seconds = seconds
+    self._last_log_time = 0
+
+  def log(self, msg, *args, **kw):
+    if time.time() - self._last_log_time > self._log_every_n_seconds:
+      self._last_log_time = time.time()
+      logging.info(msg, *args, **kw)
 
 
 class _SIGNAL(object):
@@ -460,8 +476,6 @@ class TPUInfeedOutfeedSessionHook(session_run_hook.SessionRunHook):
     self._initial_infeed_sleep_secs = (
         ctx.config.tpu_config.initial_infeed_sleep_secs)
 
-    self._feed_error = None
-    self._finished = False
     # When using model parallelism, the TPU is pre-initialized at startup to
     # fetch mesh information.  We skip re-initializing it here to avoid
     # suspected issues due to the mesh layout changing on the second
@@ -505,11 +519,13 @@ class TPUInfeedOutfeedSessionHook(session_run_hook.SessionRunHook):
 
   def _run_outfeed(self, queue_ctx, session):
     logging.info('Starting outfeed thread controller.')
+    status_logger = PeriodicLogger(seconds=60)
     with self._rendezvous.catch_errors(source='outfeed', session=session):
       for count, steps in enumerate(queue_ctx.read_iteration_counts()):
         for i in xrange(steps):
           logging.debug('Outfeed dequeue for iteration (%d, %d)', count, i)
           session.run(self._dequeue_ops)
+          status_logger.log('Outfeed finished for iteration (%d, %d)', count, i)
       logging.info('Outfeed thread finished, shutting down.')
 
   def _create_infeed_controller(self, name, target, args):
@@ -557,8 +573,6 @@ class TPUInfeedOutfeedSessionHook(session_run_hook.SessionRunHook):
                                             shutdown_timeout=watchdog_timeout)
 
   def before_run(self, run_context):
-    self._feed_error = None
-
     iterations = run_context.session.run(self._iterations_per_loop_var)
 
     logging.info('Enqueue next (%d) batch(es) of data to infeed.', iterations)
@@ -569,7 +583,6 @@ class TPUInfeedOutfeedSessionHook(session_run_hook.SessionRunHook):
     self._outfeed_controller.send_next_batch_signal(iterations)
 
   def end(self, session):
-    self._finished = True
     logging.info('Stop infeed thread controller')
     self._infeed_controller.join()
     self._rendezvous.record_done('infeed')
@@ -876,7 +889,7 @@ def generate_per_host_v2_enqueue_ops_fn_for_host(
     """Generates the per_host enqueue ops."""
     control_deps = []
     per_host_sharded_inputs = []
-    sparse_features_list = []
+    enqueue_datas_list = []
     num_replicas_per_host = ctx.num_of_replicas_per_host
     cached_signals = None
     with ops.device(device):
@@ -895,9 +908,9 @@ def generate_per_host_v2_enqueue_ops_fn_for_host(
           else:
             cached_signals = signals
 
-        features, labels, sparse_features = (
+        features, labels, enqueue_data = (
             _tpu_estimator_embedding.split_inputs(ctx, features, labels))
-        sparse_features_list.append(sparse_features)
+        enqueue_datas_list.append(enqueue_data)
 
         inputs_structure_recorder.validate_and_record_structure(
             features, labels)
@@ -930,7 +943,7 @@ def generate_per_host_v2_enqueue_ops_fn_for_host(
     if ctx.embedding_config:
       per_host_enqueue_ops.extend(
           ctx.embedding_config.tpu_embedding.generate_enqueue_ops(
-              sparse_features_list))
+              enqueue_datas_list))
 
     if signals is None:
       return per_host_enqueue_ops
@@ -1355,26 +1368,23 @@ class _InputPipeline(object):
 
 
 def call_computation(computation,
-                     experimental_exported_model_uses_all_cores=True):
+                     experimental_export_device_assignment):
   """Call computation.
-
-  computation uses a single-core for TPU inference. If
-  `experimental_exported_model_uses_all_cores` is `True`, this function will
-  round-robin
-  computation among all TPU cores visible to the host; otherwise, it will use
-  a single core.
 
   Args:
     computation: A Python function that takes no inputs and builds computation
       graph. If `computation` returns m outputs, this function will return a
       list of m Tensors.
-    experimental_exported_model_uses_all_cores: Whether to round-robin among all
-      cores visible to the host, or to use a single core.
+    experimental_export_device_assignment: If `True`, use user-provided device
+      assignment. If `False`, round-robin computation among all TPU cores
+      visible to the host.
 
   Returns:
     A list of output tensors.
   """
-  if experimental_exported_model_uses_all_cores:
+  if experimental_export_device_assignment:
+    return computation()
+  else:
     # Using `TPUPartitionedCall` makes it possible to target a different
     # TPU core with every `Session.run()` call. Note that the entire inference
     # graph executes on a single core, and that invocations of this graph
@@ -1388,8 +1398,6 @@ def call_computation(computation,
         device_ordinal=tpu_ops.tpu_ordinal_selector(),
         Tout=[o.type for o in tpu_subgraph.definition.signature.output_arg],
         f=tpu_subgraph)
-  else:
-    return computation()
 
 
 class _ModelFnWrapper(object):
@@ -1478,18 +1486,41 @@ class _ModelFnWrapper(object):
             tpu_embedding_gradient.get_gradients_through_dummy_table_variables(
                 tpu_embedding_)
         )
+        grad_multiplier = self._ctx.embedding_config.get_grad_multiplier()
+        if grad_multiplier is not None:
+          scaled_gradients = collections.OrderedDict(
+              (k, v * grad_multiplier) for k, v in six.iteritems(gradients))
+        else:
+          scaled_gradients = gradients
         apply_sparse_grads = [
-            tpu_embedding_.generate_send_gradients_op(gradients)
+            tpu_embedding_.generate_send_gradients_op(scaled_gradients)
         ]
 
       # We must run train_op to update the variables prior to running the
       # outfeed.
       with ops.control_dependencies([train_op] + apply_sparse_grads):
         host_call_outfeed_ops = []
+        host_call_fn, host_call_args = None, []
+
         if (isinstance(estimator_spec, model_fn_lib._TPUEstimatorSpec)  # pylint: disable=protected-access
             and estimator_spec.host_call is not None):
-          host_call.record({'host_call': estimator_spec.host_call})
+          host_call_fn, host_call_args = estimator_spec.host_call
+
+        if host_call_fn:
+          # Ignore dummy hostcalls (no arguments)
+          if host_call_args:
+            host_call.record({'host_call': estimator_spec.host_call})
+            host_call_outfeed_ops = host_call.create_enqueue_op()
+        else:
+          # Create a host call for the loss to track execution progress
+          # Without this, we don't have any indication of the state of the
+          # TPU program.
+          host_call.record({
+              'host_call': (lambda loss_t: loss_t,
+                            [array_ops.reshape(loss, [1])])
+          })
           host_call_outfeed_ops = host_call.create_enqueue_op()
+
         with ops.control_dependencies(host_call_outfeed_ops):
           return array_ops.identity(loss)
 
@@ -2075,7 +2106,7 @@ class TPUEstimator(estimator_lib.Estimator):
   def metric_fn(labels, logits):
     predictions = tf.argmax(logits, 1)
     return {
-      'accuracy': tf.metrics.precision(
+      'accuracy': tf.compat.v1.metrics.precision(
           labels=labels, predictions=predictions),
     }
 
@@ -2145,7 +2176,7 @@ class TPUEstimator(estimator_lib.Estimator):
   def predict_input_fn(params):
     batch_size = params['batch_size']
 
-    images = tf.random_uniform(
+    images = tf.random.uniform(
         [total_examples, height, width, 3], minval=-1, maxval=1)
 
     dataset = tf.data.Dataset.from_tensor_slices(images)
@@ -2180,8 +2211,8 @@ class TPUEstimator(estimator_lib.Estimator):
   Exporting
   =========
 
-  `export_savedmodel` exports 2 metagraphs, one with `tag_constants.SERVING`,
-  and another with `tag_constants.SERVING` and `tag_constants.TPU`.
+  `export_savedmodel` exports 2 metagraphs, one with `saved_model.SERVING`,
+  and another with `saved_model.SERVING` and `saved_model.TPU`.
   At serving time, these tags are used to select metagraph to load.
 
   Before running the graph on TPU, TPU system needs to be initialized. If
@@ -2230,9 +2261,8 @@ class TPUEstimator(estimator_lib.Estimator):
                export_to_tpu=True,
                export_to_cpu=True,
                warm_start_from=None,
-               experimental_exported_model_uses_all_cores=False,
                experimental_export_device_assignment=False,
-               experimental_embedding_config_spec=None):
+               embedding_config_spec=None):
     """Constructs an `TPUEstimator` instance.
 
     Args:
@@ -2285,19 +2315,12 @@ class TPUEstimator(estimator_lib.Estimator):
         configure warm-starting.  If the string filepath is provided instead of
         a `WarmStartSettings`, then all variables are warm-started, and it is
         assumed that vocabularies and Tensor names are unchanged.
-      experimental_exported_model_uses_all_cores: Whether to round-robin among
-        all cores visible to the host which is serving the saved model, or to
-        use a single core. This is a temporary flag to enable using all TPU
-        cores for inference with TPUPartitionedCall(). Once outside compilation
-        is supported in TPUPartitionedCall(), this flag will be enabled by
-        default.
       experimental_export_device_assignment: Whether to include the device
         assignment in the exported model. Doing so is useful in case of model
         parallel inference but will tie the exported model to the TPU topology
         used to export the model.
-      experimental_embedding_config_spec: Optional EmbeddingConfigSpec instance
-        to support using TPU embedding. IT IS STILL WORK IN PROGRESS, SO PLEASE
-        DO NOT USE.
+      embedding_config_spec: Optional EmbeddingConfigSpec instance
+        to support using TPU embedding.
 
     Raises:
       ValueError: `params` has reserved keys already.
@@ -2331,6 +2354,13 @@ class TPUEstimator(estimator_lib.Estimator):
         util_lib.check_positive_integer(predict_batch_size,
                                         'predict_batch_size')
 
+      if embedding_config_spec:
+        if (config.tpu_config.per_host_input_for_training !=
+            tpu_config.InputPipelineConfig.PER_HOST_V2):
+          raise ValueError('Only PER_HOST_V2 is supported when using TPU '
+                           'Embedding; got {}.'.format(
+                               config.tpu_config.per_host_input_for_training))
+
     # Verifies the model_fn signature according to Estimator framework.
     estimator_lib._verify_model_fn_args(model_fn, params)  # pylint: disable=protected-access
     # We cannot store config and params in this constructor as parent
@@ -2359,19 +2389,12 @@ class TPUEstimator(estimator_lib.Estimator):
     # pylint: disable=protected-access
     self._ctx = tpu_context._get_tpu_context(
         self._config, train_batch_size, eval_batch_size, predict_batch_size,
-        use_tpu, eval_on_tpu, experimental_embedding_config_spec)
+        use_tpu, eval_on_tpu, embedding_config_spec)
 
     self._export_to_cpu = export_to_cpu
     self._export_to_tpu = export_to_tpu
-    self._experimental_exported_model_uses_all_cores = (
-        experimental_exported_model_uses_all_cores)
     self._experimental_export_device_assignment = (
         experimental_export_device_assignment)
-    if (experimental_exported_model_uses_all_cores and
-        experimental_export_device_assignment):
-      raise ValueError('experimental_exported_model_uses_all_cores and '
-                       'experimental_export_device_assignment is not supported '
-                       'at the same time.')
 
     self._is_input_fn_invoked = None
     self._rendezvous = {}
@@ -2383,7 +2406,8 @@ class TPUEstimator(estimator_lib.Estimator):
                                save_variables=True,
                                mode=model_fn_lib.ModeKeys.PREDICT,
                                export_tags=None,
-                               check_variables=True):
+                               check_variables=True,
+                               strip_default_attrs=True):
     if self._export_to_tpu and mode != model_fn_lib.ModeKeys.PREDICT:
       logging.warning('TPUEstimator only handles mode PREDICT for exporting '
                       'when `export_to_tpu` is `True`; Mode {} will be ignored '
@@ -2400,7 +2424,8 @@ class TPUEstimator(estimator_lib.Estimator):
           save_variables,
           mode=mode,
           export_tags=export_tags,
-          check_variables=check_variables))
+          check_variables=check_variables,
+          strip_default_attrs=strip_default_attrs))
 
     if self._export_to_tpu and mode == model_fn_lib.ModeKeys.PREDICT:
       input_receiver_fn_map = {
@@ -2421,7 +2446,8 @@ class TPUEstimator(estimator_lib.Estimator):
           save_variables=save_variables,
           mode=mode,
           export_tags=export_tags,
-          check_variables=check_variables))
+          check_variables=check_variables,
+          strip_default_attrs=strip_default_attrs))
 
   def _call_model_fn(self, features, labels, mode, config):
     if mode == _REWRITE_FOR_INFERENCE_MODE:
@@ -2440,8 +2466,7 @@ class TPUEstimator(estimator_lib.Estimator):
         features, labels, mode, config)
     tensors = call_computation(
         computation,
-        experimental_exported_model_uses_all_cores=self
-        ._experimental_exported_model_uses_all_cores)
+        self._experimental_export_device_assignment)
     estimator_spec, export_outputs_dict, predictions_dict, none_indices = (
         capture.get())
     predictions_list = tensors[:len(predictions_dict)]
@@ -2490,13 +2515,13 @@ class TPUEstimator(estimator_lib.Estimator):
       else:
         device_assignment = None
 
-      if self._experimental_exported_model_uses_all_cores:
+      if self._experimental_export_device_assignment:
+        tensors_on_cpu = tpu.rewrite_for_inference(
+            tpu_computation, device_assignment=device_assignment)
+      else:
         tensors_on_cpu = tpu.rewrite(
             tpu_computation, device_assignment=device_assignment)
         tpu.prune_unconnected_ops_from_xla(ops.get_default_graph())
-      else:
-        tensors_on_cpu = tpu.rewrite_for_inference(
-            tpu_computation, device_assignment=device_assignment)
 
       (estimator_spec, export_outputs_dict, export_outputs_list,
        predictions_dict) = (
@@ -2835,7 +2860,7 @@ class TPUEstimator(estimator_lib.Estimator):
             graph.add_to_collection(_TPU_ENQUEUE_OPS, enqueue_op)
 
         if mode == model_fn_lib.ModeKeys.TRAIN:
-          compile_op, loss, host_call, scaffold, training_hooks = (
+          compile_op, loss, host_call, scaffold_fn, training_hooks = (
               _train_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn))
           if ctx.embedding_config:
             g = ops.get_default_graph()
@@ -2854,31 +2879,40 @@ class TPUEstimator(estimator_lib.Estimator):
                     slot_variable_names_by_table
                 ))
             tpu_init_ops.extend(embedding_variables_and_ops.load_ops())
+          # scaffold_fn must be called after variables for TPU embedding has
+          # been created on CPU, as user might reinitialize those from some
+          # checkpoint within scaffold_fn.
+          scaffold = _get_scaffold(scaffold_fn)
 
           host_ops = host_call.create_tpu_hostcall()
-          if host_ops is None:
-            host_ops = []
 
           shutdown_hooks = []
           shutdown_mode = os.environ.get('TF_TPU_GRACEFUL_SHUTDOWN_MODE',
-                                         'shutdown_worker')
+                                         'reset_computation')
           if shutdown_mode:
             if shutdown_mode == 'shutdown_worker':
               finalizer_hooks = [
-                  session_support.ShutdownLameWorkers(timeout_ms=60 * 1000),
+                  session_support.ShutdownLameWorkers(),
               ]
-            elif shutdown_mode == 'shutdown_computation':
+            elif shutdown_mode == 'shutdown_all_workers':
               finalizer_hooks = [
-                  session_support.RestartComputation(timeout_ms=60 * 1000),
+                  session_support.ShutdownAllWorkers(),
               ]
+            elif shutdown_mode == 'reset_computation':
+              finalizer_hooks = [
+                  session_support.ResetComputation(),
+              ]
+            elif not shutdown_mode:
+              finalizer_hooks = []
             else:
               raise ValueError(
                   'Unknown TF_TPU_GRACEFUL_SHUTDOWN_MODE "%s"' % shutdown_mode)
 
-            shutdown_hooks.append(
-                session_support.GracefulShutdownHook(
-                    checkpoint_prefix=self.model_dir + '/model.ckpt',
-                    on_shutdown_hooks=finalizer_hooks))
+            if finalizer_hooks:
+              shutdown_hooks.append(
+                  session_support.GracefulShutdownHook(
+                      checkpoint_prefix=self.model_dir + '/model.ckpt',
+                      on_shutdown_hooks=finalizer_hooks))
 
           with ops.control_dependencies([loss]):
             global_step = array_ops.identity(training.get_global_step())
@@ -2897,6 +2931,9 @@ class TPUEstimator(estimator_lib.Estimator):
                   tpu_init_ops=tpu_init_ops),
               InstallSignalHandlerHook()
           ])
+          if tpu_cluster_resolver.is_running_in_gce():
+            hooks.extend(
+                [preempted_hook.CloudTPUPreemptedHook(self._config.cluster)])
           if self._log_every_n_steps is not None:
             logging_hook_frequency = (  # Divide and round up
                 (self._log_every_n_steps +
@@ -2948,8 +2985,25 @@ class TPUEstimator(estimator_lib.Estimator):
               scaffold=scaffold)
 
         if mode == model_fn_lib.ModeKeys.EVAL:
-          compile_op, total_loss, host_calls, scaffold, eval_hooks = (
+          compile_op, total_loss, host_calls, scaffold_fn, eval_hooks = (
               _eval_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn))
+          if ctx.embedding_config:
+            g = ops.get_default_graph()
+            table_to_config_dict = (
+                ctx.embedding_config.tpu_embedding.table_to_config_dict)
+            embedding_variable_name_by_table, _ = (
+                _tpu_estimator_embedding.get_full_variable_names(
+                    g, table_to_config_dict)
+            )
+            embedding_variables_and_ops = (
+                ctx.embedding_config.tpu_embedding.create_variables_and_ops(
+                    embedding_variable_name_by_table
+                ))
+            tpu_init_ops.extend(embedding_variables_and_ops.load_ops())
+          # scaffold_fn must be called after variables for TPU embedding has
+          # been created on CPU, as user might reinitialize those from some
+          # checkpoint within scaffold_fn.
+          scaffold = _get_scaffold(scaffold_fn)
           iterations_per_loop_var = _create_or_get_iterations_per_loop()
           mean_loss = math_ops.div(
               total_loss,
@@ -3005,6 +3059,10 @@ class TPUEstimator(estimator_lib.Estimator):
                   tpu_init_ops=tpu_init_ops)
           ] + input_hooks
 
+          if tpu_cluster_resolver.is_running_in_gce():
+            hooks.extend(
+                [preempted_hook.CloudTPUPreemptedHook(self._config.cluster)])
+
           if eval_hooks:
             hooks.extend(eval_hooks)
 
@@ -3019,8 +3077,9 @@ class TPUEstimator(estimator_lib.Estimator):
         assert mode == model_fn_lib.ModeKeys.PREDICT
 
         (compile_op, dummy_predict_op, host_calls,
-         scaffold, prediction_hooks) = _predict_on_tpu_system(
+         scaffold_fn, prediction_hooks) = _predict_on_tpu_system(
              ctx, model_fn_wrapper, dequeue_fn)
+        scaffold = _get_scaffold(scaffold_fn)
         with ops.control_dependencies([dummy_predict_op]):
           internal_ops_to_run = _sync_variables_ops(ctx)
           with ops.control_dependencies(internal_ops_to_run):
@@ -3172,8 +3231,8 @@ def _eval_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn):
       device_assignment=ctx.device_assignment)
 
   loss = loss[0]
-  scaffold = _get_scaffold(captured_scaffold_fn)
-  return compile_op, loss, host_calls, scaffold, captured_eval_hooks.get()
+  return (compile_op, loss, host_calls, captured_scaffold_fn,
+          captured_eval_hooks.get())
 
 
 def _train_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn):
@@ -3197,8 +3256,8 @@ def _train_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn):
       device_assignment=ctx.device_assignment)
 
   loss = loss[0]
-  scaffold = _get_scaffold(captured_scaffold_fn)
-  return compile_op, loss, host_call, scaffold, captured_training_hooks.get()
+  return (compile_op, loss, host_call, captured_scaffold_fn,
+          captured_training_hooks.get())
 
 
 def _predict_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn):
@@ -3227,8 +3286,7 @@ def _predict_on_tpu_system(ctx, model_fn_wrapper, dequeue_fn):
       device_assignment=ctx.device_assignment)
 
   dummy_predict_op = dummy_predict_op[0]
-  scaffold = _get_scaffold(captured_scaffold_fn)
-  return (compile_op, dummy_predict_op, host_calls, scaffold,
+  return (compile_op, dummy_predict_op, host_calls, captured_scaffold_fn,
           captured_predict_hooks.get())
 
 
