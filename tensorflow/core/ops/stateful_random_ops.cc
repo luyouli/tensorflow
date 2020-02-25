@@ -69,6 +69,17 @@ REGISTER_OP("StatefulUniformInt")
       return Status::OK();
     });
 
+REGISTER_OP("RngSkip")
+    .Input("resource: resource")
+    .Input("algorithm: int64")
+    .Input("delta: int64")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle unused;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 0, &unused));
+      return Status::OK();
+    });
+
 REGISTER_OP("NonDeterministicInts")
     .Input("shape: shape_dtype")
     .SetIsStateful()
@@ -95,10 +106,6 @@ REGISTER_OP("StatefulRandomBinomial")
     .Attr("dtype: {half, float, double, int32, int64} = DT_INT64")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       using shape_inference::ShapeHandle;
-
-      ShapeHandle unused;
-      TF_RETURN_IF_ERROR(c->WithRankAtMost(c->input(3), 1, &unused));
-      TF_RETURN_IF_ERROR(c->WithRankAtMost(c->input(4), 1, &unused));
 
       ShapeHandle out;
       TF_RETURN_IF_ERROR(c->MakeShapeFromShapeTensor(2, &out));

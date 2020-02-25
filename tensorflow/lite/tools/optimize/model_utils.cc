@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 #include "tensorflow/lite/tools/optimize/model_utils.h"
+
 #include <memory>
 
 #include "absl/memory/memory.h"
@@ -20,6 +21,7 @@ limitations under the License.
 #include "tensorflow/lite/kernels/internal/types.h"
 #include "tensorflow/lite/model.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/tools/optimize/operator_property.h"
 
 namespace tflite {
 namespace optimize {
@@ -112,13 +114,27 @@ bool HasBuffer(const ModelT* model, const SubGraphT* subgraph,
   return true;
 }
 
-bool IsQuantized(const SubGraphT* subgraph, int tensor_index) {
-  return subgraph->tensors[tensor_index]->type != TensorType_FLOAT32;
-}
-
 bool HasMinMax(const TensorT* tensor) {
   return tensor->quantization && !tensor->quantization->min.empty() &&
          !tensor->quantization->max.empty();
+}
+
+void SetOperatorCodeVersion(ModelT* model) {
+  for (int subgraph_idx = 0; subgraph_idx < model->subgraphs.size();
+       subgraph_idx++) {
+    SubGraphT* subgraph = model->subgraphs.at(subgraph_idx).get();
+    // Iterate backward to avoid messing with index.
+    for (int op_idx = subgraph->operators.size() - 1; op_idx >= 0; op_idx--) {
+      OperatorT* op = subgraph->operators[op_idx].get();
+      OperatorCodeT* op_code = model->operator_codes[op->opcode_index].get();
+      operator_property::OperatorProperty property =
+          operator_property::GetOperatorProperty(model, subgraph_idx, op_idx);
+      if (property.quantizable) {
+        // Only update the versions of quantizable operations.
+        op_code->version = property.version;
+      }
+    }
+  }
 }
 
 }  // namespace utils

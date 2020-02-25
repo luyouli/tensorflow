@@ -22,6 +22,7 @@ limitations under the License.
 
 namespace tensorflow {
 namespace data {
+namespace experimental {
 namespace {
 
 static const double kPercentile = 90.0;
@@ -157,6 +158,13 @@ class ChooseFastestDatasetOp : public DatasetOpKernel {
 
     int64 Cardinality() const override { return cardinality_; }
 
+    Status CheckExternalState() const override {
+      for (const auto& input : inputs_) {
+        TF_RETURN_IF_ERROR(input->CheckExternalState());
+      }
+      return Status::OK();
+    }
+
    protected:
     Status AsGraphDefInternal(SerializationContext* ctx,
                               DatasetGraphDefBuilder* b,
@@ -189,7 +197,8 @@ class ChooseFastestDatasetOp : public DatasetOpKernel {
         for (size_t i = 0, num_inputs = dataset()->inputs_.size();
              i < num_inputs; ++i) {
           TF_RETURN_IF_ERROR(dataset()->inputs_[i]->MakeIterator(
-              ctx, strings::StrCat(prefix(), "_", i), &input_impls_[i]));
+              ctx, this, strings::StrCat(prefix(), "[", i, "]"),
+              &input_impls_[i]));
         }
         return Status::OK();
       }
@@ -258,7 +267,7 @@ class ChooseFastestDatasetOp : public DatasetOpKernel {
             reader->ReadScalar(full_name("fastest_index"), &fastest_index_));
         if (fastest_index_ != -1) {
           TF_RETURN_IF_ERROR(dataset()->inputs_[fastest_index_]->MakeIterator(
-              ctx, strings::StrCat(prefix(), "_", fastest_index_),
+              ctx, this, strings::StrCat(prefix(), "[", fastest_index_, "]"),
               &fastest_input_impl_));
           TF_RETURN_IF_ERROR(RestoreInput(ctx, reader, fastest_input_impl_));
         } else if (reader->Contains(full_name("input_impls_empty"))) {
@@ -309,11 +318,10 @@ class ChooseFastestDatasetOp : public DatasetOpKernel {
       }
 
       void RunnerThread(IteratorContext* ctx, InvocationResult* result, int i) {
-        int64 start = Env::Default()->NowNanos();
+        int64 start = EnvTime::NowNanos();
         Status s = input_impls_[i]->GetNext(ctx, &result->out_tensors,
                                             &result->end_of_sequence);
-        histograms_[i].Add(
-            static_cast<double>(Env::Default()->NowNanos() - start));
+        histograms_[i].Add(static_cast<double>(EnvTime::NowNanos() - start));
 
         result->status = s;
         result->notification.Notify();
@@ -357,11 +365,13 @@ class ChooseFastestDatasetOp : public DatasetOpKernel {
   std::vector<PartialTensorShape> output_shapes_;
 };  // class ChooseFastestDatasetOp
 
-// Register the kernel implementation for ChooseFastestDataset.
+REGISTER_KERNEL_BUILDER(Name("ChooseFastestDataset").Device(DEVICE_CPU),
+                        ChooseFastestDatasetOp);
 REGISTER_KERNEL_BUILDER(
     Name("ExperimentalChooseFastestDataset").Device(DEVICE_CPU),
     ChooseFastestDatasetOp);
 
 }  // namespace
+}  // namespace experimental
 }  // namespace data
 }  // namespace tensorflow

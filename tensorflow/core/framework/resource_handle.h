@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef TENSORFLOW_FRAMEWORK_RESOURCE_HANDLE_H_
 #define TENSORFLOW_FRAMEWORK_RESOURCE_HANDLE_H_
 
+#include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/platform/tensor_coding.h"
 #include "tensorflow/core/platform/types.h"
 
@@ -37,7 +39,14 @@ class ResourceHandle {
 
   // Unique name for the device containing the resource.
   const string& device() const { return device_; }
+  // Names of the devices containing the resource.
+  const std::vector<string>& allowed_devices() const {
+    return allowed_devices_;
+  }
   void set_device(const string& device) { device_ = device; }
+  void set_allowed_devices(const std::vector<string>& devices) {
+    allowed_devices_ = devices;
+  }
 
   // Container in which this resource is placed.
   const string& container() const { return container_; }
@@ -57,6 +66,15 @@ class ResourceHandle {
   const string& maybe_type_name() const { return maybe_type_name_; }
   void set_maybe_type_name(const string& value) { maybe_type_name_ = value; }
 
+  // Data types and shapes for the underlying resource.
+  std::vector<DtypeAndPartialTensorShape> dtypes_and_shapes() const {
+    return dtypes_and_shapes_;
+  }
+  void set_dtypes_and_shapes(
+      const std::vector<DtypeAndPartialTensorShape>& dtypes_and_shapes) {
+    dtypes_and_shapes_ = dtypes_and_shapes;
+  }
+
   // Conversion to and from ResourceHandleProto
   void AsProto(ResourceHandleProto* proto) const;
   void FromProto(const ResourceHandleProto& proto);
@@ -73,11 +91,17 @@ class ResourceHandle {
       "cd2c89b7-88b7-44c8-ad83-06c2a9158347";
 
  public:
+  // The default device containing the resource, where the ResourceHandle is
+  // initially created.
   string device_;
+  // A set of devices containing the resource. If empty, the resource only
+  // exists on device_. Can be represented in wildcard patterns.
+  std::vector<string> allowed_devices_;
   string container_;
   string name_;
   uint64 hash_code_ = 0;
   string maybe_type_name_;
+  std::vector<DtypeAndPartialTensorShape> dtypes_and_shapes_;
 };
 
 // For backwards compatibility for when this was a proto

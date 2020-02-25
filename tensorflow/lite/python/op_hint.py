@@ -79,7 +79,9 @@ import six as _six
 from tensorflow.core.framework import attr_value_pb2 as _attr_value_pb2
 from tensorflow.core.framework import graph_pb2 as _graph_pb2
 from tensorflow.core.framework import node_def_pb2 as _node_def_pb2
+from tensorflow.python.framework import dtypes as _dtypes
 from tensorflow.python.framework import ops as _ops
+from tensorflow.python.framework import tensor_util as _tensor_util
 # TODO(aselle): publicize these apis if we continue to use these.
 from tensorflow.python.framework.graph_util_impl import _bfs_for_reachable_nodes
 from tensorflow.python.framework.graph_util_impl import _extract_graph_summary
@@ -854,7 +856,7 @@ def _find_children_hints(call, graph_def):
     if n in reachable_by_output:
       if n not in reachable_by_input and n not in output_nodes_set:
         # special handle for while loop function def.
-        if node.op == "While":
+        if node.op == "While" or node.op == "StatelessWhile":
           body_name = node.attr["body"].func.name
           inputs_outside_loop = node.input
           for function_def in graph_def.library.function:
@@ -862,8 +864,8 @@ def _find_children_hints(call, graph_def):
               function_inputs = function_def.signature.input_arg
               assert len(inputs_outside_loop) == len(function_inputs)
               nodes_mapping = {}
-              for i, _ in enumerate(function_inputs):
-                nodes_mapping[function_inputs[i].name] = inputs_outside_loop[i]
+              for i, function_input in enumerate(function_inputs):
+                nodes_mapping[function_input.name] = inputs_outside_loop[i]
               # TODO(b/123050804): Consider use grappler.
               (children_hints_in_loop,
                new_nodes) = _find_children_hints_in_while_loop(
@@ -996,10 +998,26 @@ def _convert_single_op_hint_to_stub(call,
   # Delegate to each operand to produce the proper new input for this stub node.
   # In particular, an aggregate input will now be a Pack of some previously
   # non-fused things.
-  for input_index in sorted_input_indices:
-    inputs = call.inputs[input_index]
-    input_name = inputs.aggregate_and_return_name_for_input(out)
-    new_node.input.append(input_name)
+
+  optional_input_node = _node_def_pb2.NodeDef()
+  optional_input_node.name = "Const" + str(_uuid.uuid1().hex)
+  optional_input_node.op = "Const"
+  optional_input_node.attr["dtype"].CopyFrom(
+      _attr_value_pb2.AttrValue(type=_dtypes.float32.as_datatype_enum))
+  optional_input_node.attr["value"].CopyFrom(
+      _attr_value_pb2.AttrValue(
+          tensor=_tensor_util.make_tensor_proto([-1], _dtypes.float32, [1])))
+  out.node.extend([optional_input_node])
+
+  max_index = max(sorted_input_indices) + 1
+  for cur_index in range(max_index):
+    if cur_index in sorted_input_indices:
+      inputs = call.inputs[cur_index]
+      input_name = inputs.aggregate_and_return_name_for_input(out)
+      new_node.input.append(input_name)
+    else:
+      new_node.input.append(optional_input_node.name)
+
   new_node.attr[OpHint.TFLITE_INPUT_INDICES].list.i.extend(sorted_input_indices)
 
   # Create the function
@@ -1010,11 +1028,15 @@ def _convert_single_op_hint_to_stub(call,
   # Now call each output argument to give them a chance to make the proper
   # output type and add it to our new_node.
   output_dtypes = []
-  for output_index in sorted_output_indices:
-    output = call.outputs[output_index]
-    output_dtype = (
-        output.aggregate_and_return_name_for_output(new_node.name, output_index,
-                                                    out))
+  max_output_index = max(sorted_output_indices) + 1
+  for cur_index in range(max_output_index):
+    if cur_index in sorted_output_indices:
+      output = call.outputs[cur_index]
+      output_dtype = (
+          output.aggregate_and_return_name_for_output(new_node.name, cur_index,
+                                                      out))
+    else:
+      output_dtype = optional_input_node.attr["type"].i
     output_dtypes.append(output_dtype)
   new_node.attr["_output_types"].list.type[:] = output_dtypes
   # TODO(aselle): what is right here?
@@ -1182,8 +1204,7 @@ def _convert_op_hints_to_stubs_helper(
       # Re-wire the children hints inputs/outputs, so latter child's inputs
       # connect to previous child node's outputs.
       children_inputs_mappings = hints[hint_uuid].children_inputs_mappings
-      for j in range(len(children_hints)):
-        child_hint = children_hints[j]
+      for j, child_hint in enumerate(children_hints):
         if j == 0:
           for mapping in children_inputs_mappings["parent_first_child_input"]:
             parent_input_index = _get_correct_mapping(
@@ -1210,8 +1231,7 @@ def _convert_op_hints_to_stubs_helper(
             child_hint.outputs[child_output_index] = hints[hint_uuid].outputs[
                 parent_output_index]
 
-      for j in range(len(children_hints)):
-        child_hint = children_hints[j]
+      for j, child_hint in enumerate(children_hints):
         curr_graph_def = _convert_single_op_hint_to_stub(
             child_hint, curr_graph_def, function_def_nodes,
             j == len(children_hints) - 1)

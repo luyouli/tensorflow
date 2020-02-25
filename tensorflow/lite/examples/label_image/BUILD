@@ -1,11 +1,12 @@
 # Description:
 # TensorFlow Lite Example Label Image.
 
-package(default_visibility = ["//visibility:public"])
-
-licenses(["notice"])  # Apache 2.0
-
 load("//tensorflow/lite:build_def.bzl", "tflite_linkopts")
+
+package(
+    default_visibility = ["//visibility:public"],
+    licenses = ["notice"],  # Apache 2.0
+)
 
 exports_files(glob([
     "testdata/*.bmp",
@@ -22,6 +23,7 @@ cc_binary(
         "//tensorflow:android": [
             "-pie",  # Android 5.0 and later supports only PIE
             "-lm",  # some builtin ops, e.g., tanh, need -lm
+            "-Wl,-rpath=/data/local/tmp",  # for hexagon delegate
         ],
         "//conditions:default": [],
     }),
@@ -29,8 +31,22 @@ cc_binary(
         ":bitmap_helpers",
         "//tensorflow/lite:framework",
         "//tensorflow/lite:string_util",
+        "//tensorflow/lite/delegates/nnapi:nnapi_delegate",
         "//tensorflow/lite/kernels:builtin_ops",
-    ],
+        "//tensorflow/lite/profiling:profiler",
+        "//tensorflow/lite/tools/evaluation:utils",
+        "@com_google_absl//absl/memory",
+    ] + select({
+        "//tensorflow:android": [
+            "//tensorflow/lite/delegates/gpu:gl_delegate",
+            "//tensorflow/lite/experimental/delegates/hexagon:hexagon_delegate",
+        ],
+        "//tensorflow:android_arm64": [
+            "//tensorflow/lite/delegates/gpu:gl_delegate",
+            "//tensorflow/lite/experimental/delegates/hexagon:hexagon_delegate",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -48,7 +64,17 @@ cc_library(
         "//tensorflow/lite:string_util",
         "//tensorflow/lite/kernels:builtin_ops",
         "//tensorflow/lite/schema:schema_fbs",
-    ],
+    ] + select({
+        "//tensorflow:android": [
+            "//tensorflow/lite/delegates/gpu:gl_delegate",
+            "//tensorflow/lite/experimental/delegates/hexagon:hexagon_delegate",
+        ],
+        "//tensorflow:android_arm64": [
+            "//tensorflow/lite/delegates/gpu:gl_delegate",
+            "//tensorflow/lite/experimental/delegates/hexagon:hexagon_delegate",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 cc_test(

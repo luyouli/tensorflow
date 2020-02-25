@@ -16,19 +16,36 @@ limitations under the License.
 #ifndef TENSORFLOW_LITE_EXPERIMENTAL_RUY_OPT_SET_H_
 #define TENSORFLOW_LITE_EXPERIMENTAL_RUY_OPT_SET_H_
 
-#ifndef RUY_OPT_SET
-#define RUY_OPT_SET 0x3ff
-#endif
-
+// RUY_OPT_SET is a compile-time API that Ruy provides for enabling/disabling
+// certain optimizations. It should be used by defining that macro on the
+// compiler command line.
+//
+// Each bit in RUY_OPT_SET controls a particular optimization done in Ruy.
 #define RUY_OPT_INTRINSICS 0x1
 #define RUY_OPT_ASM 0x2
 #define RUY_OPT_TUNING 0x4
 #define RUY_OPT_FAT_KERNEL 0x8
 #define RUY_OPT_NATIVE_ROUNDING 0x10
-#define RUY_OPT_FRACTAL 0x20
-#define RUY_OPT_FRACTAL_U 0x40
-#define RUY_OPT_AVOID_ALIASING 0x80
-#define RUY_OPT_MAX_STREAMING 0x100
-#define RUY_OPT_PREFETCH 0x200
+#define RUY_OPT_AVOID_ALIASING 0x20
+#define RUY_OPT_MAX_STREAMING 0x40
+#define RUY_OPT_PACK_AHEAD 0x80
+#define RUY_OPT_PREFETCH_LOAD 0x100
+#define RUY_OPT_PREFETCH_STORE 0x200
+#define RUY_OPT_FRACTAL_Z 0x400
+#define RUY_OPT_FRACTAL_U 0x800
+#define RUY_OPT_FRACTAL_HILBERT 0x1000
+
+#if !defined(RUY_OPT_SET)
+#ifdef RUY_OPTIMIZE_FOR_MATMUL_BENCHMARK
+// Load prefetching is detrimental in matrix multiplication benchmarks.
+// Store prefetching is not.
+#define RUY_OPT_SET (~RUY_OPT_PREFETCH_LOAD)
+#else
+// Default to all optimizations.
+#define RUY_OPT_SET (~0)
+#endif
+#endif
+
+#define RUY_OPT_ENABLED(ruy_opt) ((RUY_OPT_SET & ruy_opt) != 0)
 
 #endif  // TENSORFLOW_LITE_EXPERIMENTAL_RUY_OPT_SET_H_

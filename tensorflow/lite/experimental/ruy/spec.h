@@ -16,8 +16,11 @@ limitations under the License.
 #ifndef TENSORFLOW_LITE_EXPERIMENTAL_RUY_SPEC_H_
 #define TENSORFLOW_LITE_EXPERIMENTAL_RUY_SPEC_H_
 
-#include <cstdint>
 #include <limits>
+#include <type_traits>
+
+#include "tensorflow/lite/experimental/ruy/cpu_cache_size.h"
+#include "tensorflow/lite/experimental/ruy/matrix.h"
 
 namespace ruy {
 
@@ -37,16 +40,14 @@ enum class LoopStructure { kGeneral, kSimple, kAuto };
 enum class ZeroPointSupport { kGeneral, kSymmetric };
 
 // In general we allow all Layout's, even if we may use slow paths for some
-// kinds of layouts. By choosing kPackedLinearRCC, one may opt out of this and
+// kinds of layouts. By choosing kRCC, one may opt out of this and
 // only keep support for the simplest and most efficient combination of
 // Layout's, in exchange for smaller code size. The case covered by
-// kPackedLinearRCC is that where all matrix layouts are linear (no sub-block
-// structure), packed (no striding), and where the storage orders are exactly
-// the following:
+// kRCC is where the storage orders are exactly the following:
 //    - LHS is RowMajor
 //    - RHS is ColMajor
 //    - Destination is ColMajor
-enum class LayoutSupport { kGeneral, kPackedLinearRCC };
+enum class LayoutSupport { kGeneral, kRCC };
 
 // A Spec describes all about a matrix multiplication operation that isn't
 // encoded in the LHS, RHS and destination matrices. Some of that information
@@ -83,9 +84,13 @@ struct BasicSpec {
   // multiplier_fixedpoint_perchannel must be nullptr.
   const int* multiplier_exponent_perchannel = nullptr;
   // min clamp bound of destination values.
-  DstScalar clamp_min = std::numeric_limits<DstScalar>::lowest();
+  DstScalar clamp_min = std::is_floating_point<DstScalar>::value
+                            ? -std::numeric_limits<DstScalar>::infinity()
+                            : std::numeric_limits<DstScalar>::lowest();
   // max clamp bound of destination values.
-  DstScalar clamp_max = std::numeric_limits<DstScalar>::max();
+  DstScalar clamp_max = std::is_floating_point<DstScalar>::value
+                            ? std::numeric_limits<DstScalar>::infinity()
+                            : std::numeric_limits<DstScalar>::max();
   // See above enum LoopStructure
   static constexpr LoopStructure kLoopStructure = LoopStructure::kAuto;
   // See above enum LayoutSupport
@@ -93,6 +98,19 @@ struct BasicSpec {
   // See above enum ZeroPointSupport
   static constexpr ZeroPointSupport kZeroPointSupport =
       ZeroPointSupport::kGeneral;
+  // Testing-only, not meant to be used by actual users:
+  // Used for testing of various kernel layouts.
+  using StandardCppKernelLhsLayout = FixedKernelLayout<Order::kColMajor, 1, 1>;
+  using StandardCppKernelRhsLayout = FixedKernelLayout<Order::kColMajor, 1, 1>;
+  // Returns (a reasonable estimate of) the local CPU cache size.
+  // See ruy::LocalDataCacheSize() which returns some coarse, sane default for
+  // each CPU architecture.
+  // This may be overridden, either to provide more accurate/runtime values,
+  // or to test with other values to let testcases have more coverage.
+  static int local_data_cache_size() { return LocalDataCacheSize(); }
+  // Same as local_data_cache_size but for the total data cache size accessible
+  // to each CPU core. See ruy::SharedDataCacheSize().
+  static int shared_data_cache_size() { return SharedDataCacheSize(); }
 };
 
 }  // namespace ruy

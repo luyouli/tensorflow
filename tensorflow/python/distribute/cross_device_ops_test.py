@@ -28,14 +28,13 @@ from tensorflow.python.distribute import combinations
 from tensorflow.python.distribute import cross_device_ops as cross_device_ops_lib
 from tensorflow.python.distribute import cross_device_utils
 from tensorflow.python.distribute import device_util
-from tensorflow.python.distribute import mirrored_strategy
 from tensorflow.python.distribute import multi_worker_test_base
 from tensorflow.python.distribute import reduce_util
-from tensorflow.python.distribute import strategy_combinations
 from tensorflow.python.distribute import values as value_lib
 from tensorflow.python.eager import context
 from tensorflow.python.eager import test
 from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import kernels
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
@@ -45,7 +44,9 @@ def _get_devices(devices):
   if isinstance(devices, (tuple, list)):
     return tuple(device_util.resolve(d) for d in devices)
   elif isinstance(devices, value_lib.DistributedValues):
-    return devices.devices
+    return devices._devices
+  elif isinstance(devices, ops.Tensor):
+    return (device_util.resolve(devices.device),)
   return (device_util.resolve(devices),)
 
 
@@ -65,7 +66,7 @@ def _make_per_replica(values, devices, regroup=False):
     with ops.device(d):
       placed_v = array_ops.identity(v)
     index.append(placed_v)
-  return value_lib.PerReplica(value_lib.ReplicaDeviceMap(devices), index)
+  return value_lib.regroup(index)
 
 
 # pylint: disable=g-doc-args,g-doc-return-or-yield
@@ -76,8 +77,13 @@ def _fake_mirrored(value, devices):
   true in reality.
   """
   devices = _get_devices(devices)
-  return value_lib.Mirrored(value_lib.ReplicaDeviceMap(devices),
-                            [value] * len(devices))
+  values = []
+  for d in devices:
+    with ops.device(d):
+      values.append(array_ops.identity(value))
+  return value_lib.regroup(
+      values,
+      wrap_class=value_lib.Mirrored)
 
 
 def _make_indexed_slices(values, indices, dense_shape, device):
@@ -92,7 +98,9 @@ def _make_indexed_slices(values, indices, dense_shape, device):
 def _make_mirrored_indexed_slices(devices, values, indices, dense_shape):
   values = [_make_indexed_slices(values, indices, dense_shape, d)
             for d in devices]
-  return value_lib.Mirrored(value_lib.ReplicaDeviceMap(devices), values)
+  return value_lib.regroup(
+      values,
+      wrap_class=value_lib.Mirrored)
 
 
 _cpu_device = "/device:CPU:0"
@@ -103,147 +111,156 @@ class CrossDeviceOpsTestBase(test.TestCase, parameterized.TestCase):
   def _assert_indexed_slices_equal(self, left, right):
     self.assertIsInstance(left, ops.IndexedSlices)
     self.assertIsInstance(right, ops.IndexedSlices)
-    self.assertEqual(device_util.resolve(left.device),
-                     device_util.resolve(right.device))
+    self.assertEqual(
+        device_util.resolve(left.device), device_util.resolve(right.device))
     self.assertAllEqual(
         self.evaluate(ops.convert_to_tensor(left)),
         self.evaluate(ops.convert_to_tensor(right)))
 
-  def _assert_values_equal(self, left, right):
-    if isinstance(left, list):
-      for l, r in zip(left, right):
-        self._assert_values_equal(l, r)
-    else:
+  def _assert_mirrored_equal(self, left_list, right_list, sess):
+    if not isinstance(left_list, list):
+      left_list, right_list = [left_list], [right_list]
+
+    for left, right in zip(left_list, right_list):
       self.assertEqual(type(left), type(right))
-      self.assertEqual(set(left.devices), set(right.devices))
-      if isinstance(left.values[0], ops.IndexedSlices):
-        for d in left.devices:
-          self._assert_indexed_slices_equal(left.get(d), right.get(d))
-      elif context.executing_eagerly():
-        self.assertEqual([v.numpy() for v in left.values],
-                         list(right.values))
+
+      # Convert Mirrored to a list since sess.run(Mirrored) only returns one
+      # value.
+      if isinstance(left, value_lib.Mirrored):
+        left, right = left.values, right.values
       else:
-        with self.cached_session() as sess:
-          self.assertEqual(
-              sess.run(list(left.values)), list(right.values))
+        # When there's only one replica Mirrored is automatically unwrapped.
+        left, right = [left], [right]
 
-  def _testReductionAndBroadcast(self, cross_device_ops, distribution):
-    devices = distribution.extended.worker_devices
+      for left_value, right_value in zip(left, right):
+        self.assertEqual(left_value.device, right_value.device)
 
-    values = [constant_op.constant(float(d)) for d in range(len(devices))]
-    per_replica = _make_per_replica(values, devices)
-    mean = (len(devices) - 1.) / 2.
+      # Densify IndexedSlices.
+      left = [ops.convert_to_tensor(v) for v in left]
+      right = [ops.convert_to_tensor(v) for v in right]
+      left, right = sess.run((left, right))
+      for left_value, right_value in zip(left, right):
+        self.assertAllEqual(left_value, right_value)
 
-    values_2 = [constant_op.constant(d + 1.0) for d in range(len(devices))]
-    per_replica_2 = _make_per_replica(values_2, devices)
-    mean_2 = mean + 1.
+  def _testReductionAndBroadcast(self, cross_device_ops, devices):
+    if context.num_gpus() < sum(1 for d in devices if "GPU" in d.upper()):
+      self.skipTest("Not enough GPUs")
 
-    destination_mirrored = _fake_mirrored(1., devices)
-    destination_different = _fake_mirrored(1., _cpu_device)
-    destination_str = _cpu_device
+    with self.cached_session() as sess:
+      values = [constant_op.constant(float(d)) for d in range(len(devices))]
+      per_replica = _make_per_replica(values, devices)
+      mean = (len(devices) - 1.) / 2.
 
-    all_destinations = [
-        destination_mirrored, destination_different, destination_str,
-    ]
+      values_2 = [constant_op.constant(d + 1.0) for d in range(len(devices))]
+      per_replica_2 = _make_per_replica(values_2, devices)
+      mean_2 = mean + 1.
 
-    # test reduce()
-    for destinations in all_destinations:
-      self._assert_values_equal(
-          cross_device_ops.reduce(
-              reduce_util.ReduceOp.MEAN,
-              per_replica,
-              destinations=destinations),
-          _fake_mirrored(mean, destinations))
-      self._assert_values_equal(
-          cross_device_ops.reduce(
-              reduce_util.ReduceOp.MEAN,
-              per_replica_2,
-              destinations=destinations),
-          _fake_mirrored(mean_2, destinations))
-      self._assert_values_equal(
-          cross_device_ops.reduce(
-              reduce_util.ReduceOp.SUM, per_replica,
-              destinations=destinations),
-          _fake_mirrored(mean * len(devices), destinations))
-      self._assert_values_equal(
-          cross_device_ops.reduce(
-              reduce_util.ReduceOp.SUM,
-              per_replica_2,
-              destinations=destinations),
-          _fake_mirrored(mean_2 * len(devices), destinations))
+      destination_mirrored = _fake_mirrored(1., devices)
+      destination_different = _fake_mirrored(1.,
+                                             device_util.resolve(_cpu_device))
+      destination_str = device_util.resolve(_cpu_device)
 
-    # test batch_reduce()
-    for d1, d2 in itertools.product(all_destinations, all_destinations):
-      self._assert_values_equal(
-          cross_device_ops.batch_reduce(
-              reduce_util.ReduceOp.MEAN,
-              [(per_replica, d1), (per_replica_2, d2)]),
-          [
-              _fake_mirrored(mean, d1),
-              _fake_mirrored(mean_2, d2)
-          ])
-      self._assert_values_equal(
-          cross_device_ops.batch_reduce(
-              reduce_util.ReduceOp.SUM,
-              [(per_replica, d1), (per_replica_2, d2)]),
-          [
-              _fake_mirrored(mean * len(devices), d1),
-              _fake_mirrored(mean_2 * len(devices), d2)
-          ])
+      all_destinations = [
+          destination_mirrored,
+          destination_different,
+          destination_str,
+      ]
 
-    # test broadcast()
-    for destinations in all_destinations:
-      self._assert_values_equal(
-          cross_device_ops.broadcast(constant_op.constant(1.), destinations),
-          _fake_mirrored(1., destinations))
+      # test reduce()
+      for destinations in all_destinations:
+        self._assert_mirrored_equal(
+            cross_device_ops.reduce(
+                reduce_util.ReduceOp.MEAN,
+                per_replica,
+                destinations=destinations), _fake_mirrored(mean, destinations),
+            sess)
+        self._assert_mirrored_equal(
+            cross_device_ops.reduce(
+                reduce_util.ReduceOp.MEAN,
+                per_replica_2,
+                destinations=destinations),
+            _fake_mirrored(mean_2, destinations), sess)
+        self._assert_mirrored_equal(
+            cross_device_ops.reduce(
+                reduce_util.ReduceOp.SUM,
+                per_replica,
+                destinations=destinations),
+            _fake_mirrored(mean * len(devices), destinations), sess)
+        self._assert_mirrored_equal(
+            cross_device_ops.reduce(
+                reduce_util.ReduceOp.SUM,
+                per_replica_2,
+                destinations=destinations),
+            _fake_mirrored(mean_2 * len(devices), destinations), sess)
+
+      # test batch_reduce()
+      for d1, d2 in itertools.product(all_destinations, all_destinations):
+        self._assert_mirrored_equal(
+            cross_device_ops.batch_reduce(reduce_util.ReduceOp.MEAN,
+                                          [(per_replica, d1),
+                                           (per_replica_2, d2)]),
+            [_fake_mirrored(mean, d1),
+             _fake_mirrored(mean_2, d2)], sess)
+        self._assert_mirrored_equal(
+            cross_device_ops.batch_reduce(reduce_util.ReduceOp.SUM,
+                                          [(per_replica, d1),
+                                           (per_replica_2, d2)]),
+            [
+                _fake_mirrored(mean * len(devices), d1),
+                _fake_mirrored(mean_2 * len(devices), d2)
+            ], sess)
+
+      # test broadcast()
+      for destinations in all_destinations:
+        self._assert_mirrored_equal(
+            cross_device_ops.broadcast(constant_op.constant(1.), destinations),
+            _fake_mirrored(1., destinations), sess)
 
   def _testIndexedSlicesAllReduce(self, devices, cross_device_ops_instance,
                                   reduce_op, batch_reduce):
-    dense_shape = [5, 2]
-    t0 = _make_indexed_slices([[1., 2.]], [1], dense_shape, devices[0])
-    t1 = _make_indexed_slices([[3., 4.], [5., 6.]], [1, 3], dense_shape,
-                              devices[1])
-    per_replica = value_lib.PerReplica(
-        value_lib.ReplicaDeviceMap(devices), (t0, t1))
+    with self.cached_session() as sess:
+      dense_shape = [5, 2]
+      t0 = _make_indexed_slices([[1., 2.]], [1], dense_shape, devices[0])
+      t1 = _make_indexed_slices([[3., 4.], [5., 6.]], [1, 3], dense_shape,
+                                devices[1])
+      per_replica = value_lib.PerReplica((t0, t1))
 
-    if batch_reduce:
-      result = cross_device_ops_instance.batch_reduce(
-          reduce_op, [(per_replica, per_replica)])
-    else:
-      result = cross_device_ops_instance.reduce(reduce_op, per_replica,
-                                                per_replica)
+      if batch_reduce:
+        result = cross_device_ops_instance.batch_reduce(
+            reduce_op, [(per_replica, per_replica)])
+      else:
+        result = cross_device_ops_instance.reduce(reduce_op, per_replica,
+                                                  per_replica)
 
-    total_indices_with_dups = [1, 1, 3]
-    total_indices_without_dups = [1, 3]
+      total_indices_with_dups = [1, 1, 3]
+      total_indices_without_dups = [1, 3]
 
-    if reduce_op == reduce_util.ReduceOp.SUM:
-      total_values_with_dups = [[1., 2.], [3., 4.], [5., 6.]]
-      total_values_without_dups = [[4., 6.], [5., 6.]]
-    else:
-      assert reduce_op == reduce_util.ReduceOp.MEAN
-      total_values_with_dups = [[0.5, 1.], [1.5, 2.], [2.5, 3.]]
-      total_values_without_dups = [[2., 3.], [2.5, 3.]]
+      if reduce_op == reduce_util.ReduceOp.SUM:
+        total_values_with_dups = [[1., 2.], [3., 4.], [5., 6.]]
+        total_values_without_dups = [[4., 6.], [5., 6.]]
+      else:
+        assert reduce_op == reduce_util.ReduceOp.MEAN
+        total_values_with_dups = [[0.5, 1.], [1.5, 2.], [2.5, 3.]]
+        total_values_without_dups = [[2., 3.], [2.5, 3.]]
 
-    total_mirrored_with_dups = _make_mirrored_indexed_slices(
-        devices, total_values_with_dups, total_indices_with_dups, dense_shape)
-    total_mirrored_without_dups = _make_mirrored_indexed_slices(
-        devices, total_values_without_dups, total_indices_without_dups,
-        dense_shape)
+      total_mirrored_with_dups = _make_mirrored_indexed_slices(
+          devices, total_values_with_dups, total_indices_with_dups, dense_shape)
+      total_mirrored_without_dups = _make_mirrored_indexed_slices(
+          devices, total_values_without_dups, total_indices_without_dups,
+          dense_shape)
 
-    # Test that the result is semantically equal to both the concatenated
-    # IndexedSlices, as well as when the duplicate indices are summed up.
-    if batch_reduce:
-      total_mirrored_with_dups = [total_mirrored_with_dups]
-      total_mirrored_without_dups = [total_mirrored_without_dups]
+      # Test that the result is semantically equal to both the concatenated
+      # IndexedSlices, as well as when the duplicate indices are summed up.
+      if batch_reduce:
+        total_mirrored_with_dups = [total_mirrored_with_dups]
+        total_mirrored_without_dups = [total_mirrored_without_dups]
 
-    self._assert_values_equal(total_mirrored_with_dups, result)
-    self._assert_values_equal(total_mirrored_without_dups, result)
+      self._assert_mirrored_equal(total_mirrored_with_dups, result, sess)
+      self._assert_mirrored_equal(total_mirrored_without_dups, result, sess)
 
 
 class SingleWorkerCrossDeviceOpsTest(CrossDeviceOpsTestBase):
-  # TODO(yuefengz): decouple the num_gpus check from distribution in
-  # combinations module so that we can pass in devices instead of a distribution
-  # strategy.
+
   reduction_to_one_combinations = combinations.combine(
       cross_device_ops=[
           combinations.NamedObject("DefaultReductionToOneDevice",
@@ -255,73 +272,73 @@ class SingleWorkerCrossDeviceOpsTest(CrossDeviceOpsTestBase):
           combinations.NamedObject(
               "AccumulateNCrossDeviceOp",
               cross_device_ops_lib.ReductionToOneDevice(
-                  accumulation_fn=math_ops.accumulate_n)),
+                  accumulation_fn=math_ops.add_n)),
       ],
-      distribution=[
-          strategy_combinations.one_device_strategy,
-          strategy_combinations.mirrored_strategy_with_gpu_and_cpu,
-          strategy_combinations.mirrored_strategy_with_two_gpus,
+      devices=[
+          ["/cpu:0"],
+          ["/cpu:0", "/gpu:0"],
+          ["/gpu:0", "/gpu:1"],
       ],
       mode=["graph", "eager"])
   allreduce_combinations = combinations.combine(
       cross_device_ops=[
           combinations.NamedObject(
               "AllReduce",
-              cross_device_ops_lib.AllReduceCrossDeviceOps("nccl", 1, 0, 0)),
+              cross_device_ops_lib.AllReduceCrossDeviceOps("nccl", 1)),
           combinations.NamedObject(
               "AllReduceNoGradientRepacking",
-              cross_device_ops_lib.AllReduceCrossDeviceOps("nccl", 0, 0, 0)),
+              cross_device_ops_lib.AllReduceCrossDeviceOps("nccl", 0)),
           combinations.NamedObject("NcclAllReduce",
                                    cross_device_ops_lib.NcclAllReduce()),
           combinations.NamedObject(
               "HierarchicalCopy",
               cross_device_ops_lib.HierarchicalCopyAllReduce(8)),
-          combinations.NamedObject(
-              "HierarchicalCopyAggregateSmallTensors",
-              cross_device_ops_lib.AllReduceCrossDeviceOps(
-                  "hierarchical_copy", 0, 100, 10))
       ],
-      distribution=[
-          strategy_combinations.mirrored_strategy_with_two_gpus,
+      devices=[
+          ["/gpu:0", "/gpu:1"],
       ],
       mode=["graph", "eager"])
 
   @combinations.generate(reduction_to_one_combinations + allreduce_combinations)
-  def testReductionAndBroadcast(self, cross_device_ops, distribution):
-    with distribution.scope():
-      self._testReductionAndBroadcast(cross_device_ops, distribution)
+  def testReductionAndBroadcast(self, cross_device_ops, devices):
+    self._testReductionAndBroadcast(cross_device_ops, devices)
 
   def testChooseAlgorithm(self):
-    device_links = [[1, 2, 3, 4], [0, 2, 3, 5], [0, 1, 3, 6], [0, 1, 2, 7],
-                    [0, 5, 6, 7], [1, 4, 6, 7], [2, 4, 5, 7], [3, 4, 5, 6]]
-    result = cross_device_ops_lib._choose_all_reduce_algorithm(device_links)
-    self.assertIsInstance(result, cross_device_ops_lib.AllReduceCrossDeviceOps)
-    self.assertEqual(result._all_reduce_alg, "hierarchical_copy")
-    self.assertEqual(result._num_packs, 8)
+    # Not use nccl if there is any cpu device.
+    self.assertIsInstance(
+        cross_device_ops_lib.choose_the_best(["/cpu:0"]),
+        cross_device_ops_lib.ReductionToOneDevice)
 
-    # if there are only 4 devices
-    device_links = [[1, 2, 3, 4], [0, 2, 3, 5], [0, 1, 3, 6], [0, 1, 2, 7]]
-    result = cross_device_ops_lib._choose_all_reduce_algorithm(device_links)
-    self.assertIsInstance(result, cross_device_ops_lib.AllReduceCrossDeviceOps)
-    self.assertEqual(result._all_reduce_alg, "nccl")
-    self.assertEqual(result._num_packs, 1)
+    # Not use nccl if requested device is not visible to TensorFlow.
+    # TODO(yuefengz): make `choose_the_best` work with device strings
+    # self.assertIsInstance(
+    #     cross_device_ops_lib.choose_the_best(["/gpu:100"]),
+    #     cross_device_ops_lib.ReductionToOneDevice)
 
-    # if devices links contain each device itself
-    device_links = [[0, 1, 2, 3, 4], [0, 1, 2, 3, 5], [0, 1, 2, 3, 6],
-                    [0, 1, 2, 3, 7], [0, 4, 5, 6, 7], [1, 4, 5, 6, 7],
-                    [2, 4, 5, 6, 7], [3, 4, 5, 6, 7]]
-    result = cross_device_ops_lib._choose_all_reduce_algorithm(device_links)
-    self.assertIsInstance(result, cross_device_ops_lib.AllReduceCrossDeviceOps)
-    self.assertEqual(result._all_reduce_alg, "hierarchical_copy")
-    self.assertEqual(result._num_packs, 8)
+    if context.num_gpus() < 1:
+      return
 
-    # if not dgx1-like links
-    device_links = [[0, 2, 3, 5], [0, 1, 3, 6], [0, 1, 2, 7], [0, 5, 6, 7],
-                    [1, 4, 6, 7], [2, 4, 5, 7], [3, 4, 5, 6], [1, 2, 3, 4]]
-    result = cross_device_ops_lib._choose_all_reduce_algorithm(device_links)
-    self.assertIsInstance(result, cross_device_ops_lib.AllReduceCrossDeviceOps)
-    self.assertEqual(result._all_reduce_alg, "nccl")
-    self.assertEqual(result._num_packs, 1)
+    devices = ["/gpu:0"]
+
+    def mock_get_registered_kernels_for_op(op):
+      if op == "NcclAllReduce":
+        return [object]
+      else:
+        return []
+
+    # Use nccl if nccl kernel is found.
+    with test.mock.patch.object(kernels, "get_registered_kernels_for_op",
+                                mock_get_registered_kernels_for_op):
+      self.assertIsInstance(
+          cross_device_ops_lib.choose_the_best(devices),
+          cross_device_ops_lib.NcclAllReduce)
+
+    # Not use nccl if nccl kernel is not found.
+    with test.mock.patch.object(kernels,
+                                "get_registered_kernels_for_op", lambda _: []):
+      self.assertIsInstance(
+          cross_device_ops_lib.choose_the_best(devices),
+          cross_device_ops_lib.ReductionToOneDevice)
 
   @combinations.generate(combinations.combine(
       mode=["graph", "eager"],
@@ -330,8 +347,7 @@ class SingleWorkerCrossDeviceOpsTest(CrossDeviceOpsTestBase):
     devices = ["/cpu:0", "/gpu:0"]
     t0 = _make_indexed_slices([[1., 2.]], [1], [5, 2], devices[0])
     t1 = _make_indexed_slices([[3., 4.], [5., 6.]], [1, 3], [5, 2], devices[1])
-    per_replica = value_lib.PerReplica(
-        value_lib.ReplicaDeviceMap(devices), (t0, t1))
+    per_replica = value_lib.PerReplica((t0, t1))
     result = cross_device_ops_lib._simple_reduce(
         per_replica, devices[0], math_ops.add_n, reduce_util.ReduceOp.SUM)
 
@@ -377,56 +393,50 @@ class MultiWorkerCrossDeviceOpsTest(multi_worker_test_base.MultiWorkerTestBase,
               "MultiWorkerAllReduce",
               cross_device_ops_lib.MultiWorkerAllReduce(worker_devices, 2,
                                                         ("pscpu/pscpu", 2, -1),
-                                                        0, 0, 0)),
+                                                        0)),
           combinations.NamedObject(
               "MultiWorkerAllReducePack",
               cross_device_ops_lib.MultiWorkerAllReduce(worker_devices, 2,
                                                         ("pscpu/pscpu", 2, -1),
-                                                        1, 0, 0)),
-          combinations.NamedObject(
-              "MultiWorkerAllReduceAggregation",
-              cross_device_ops_lib.MultiWorkerAllReduce(worker_devices, 2,
-                                                        ("pscpu/pscpu", 2, -1),
-                                                        0, 100, 10)),
+                                                        1)),
           combinations.NamedObject(
               "MultiWorkerAllReduceMultipleSpecs",
               cross_device_ops_lib.MultiWorkerAllReduce(
                   worker_devices, 2, [("pscpu/pscpu", 2, 100),
-                                      ("xring", 2, -1)], 0, 0, 0)),
+                                      ("xring", 2, -1)], 0)),
       ],
-      distribution=[
-          combinations.NamedDistribution(
-              "MirroredCPU",
-              lambda: mirrored_strategy.MirroredStrategy(["/device:CPU:0"]),
-              required_gpus=0),
-          combinations.NamedDistribution(
-              "Mirrored1GPU",
-              lambda: mirrored_strategy.MirroredStrategy(["/device:GPU:0"]),
-              required_gpus=1),
-          combinations.NamedDistribution(
-              "Mirrored2GPUs",
-              # pylint: disable=g-long-lambda
-              lambda: mirrored_strategy.MirroredStrategy(
-                  ["/device:GPU:0", "/device:GPU:1"]),
-              required_gpus=2),
+      devices=[
+          [
+              "/job:worker/replica:0/task:0/device:CPU:0",
+              "/job:worker/replica:0/task:1/device:CPU:0"
+          ],
+          [
+              "/job:worker/replica:0/task:0/device:GPU:0",
+              "/job:worker/replica:0/task:1/device:GPU:0"
+          ],
+          [
+              "/job:worker/replica:0/task:0/device:GPU:0",
+              "/job:worker/replica:0/task:0/device:GPU:1",
+              "/job:worker/replica:0/task:1/device:GPU:0",
+              "/job:worker/replica:0/task:1/device:GPU:1"
+          ],
       ],
       mode=["graph"])
 
   @combinations.generate(multi_worker_allreduce_combinations)
-  def testReductionAndBroadcast(self, cross_device_ops, distribution):
-    distribution.configure(cluster_spec={
-        "worker":
-            ["/job:worker/replica:0/task:0", "/job:worker/replica:0/task:1"]
-    })
-    with distribution.scope():
-      self._testReductionAndBroadcast(cross_device_ops, distribution)
+  def testReductionAndBroadcast(self, cross_device_ops, devices):
+    # Mimic the default device of multi-worker strategies.
+    with ops.device("/job:worker/replica:0/task:0"):
+      self._testReductionAndBroadcast(cross_device_ops, devices)
 
 
 NUM_WORKERS = 3
 
+CollectiveCommunication = cross_device_ops_lib.CollectiveCommunication
+
 
 class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
-                              parameterized.TestCase):
+                              CrossDeviceOpsTestBase):
 
   collective_key_base = 100000
 
@@ -446,14 +456,14 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
                         task_type,
                         task_id,
                         num_gpus=0,
+                        communication=CollectiveCommunication.AUTO,
                         use_strategy_object=False,
-                        local_mode=False):
+                        local_mode=False,
+                        num_packs=1):
     collective_keys = cross_device_utils.CollectiveKeys(
-        group_key_start=10 * num_gpus +
-        CollectiveAllReduceTest.collective_key_base,
-        instance_key_start=num_gpus * 100 +
-        CollectiveAllReduceTest.collective_key_base,
-        instance_key_with_id_start=num_gpus * 10000 +
+        group_key_start=10 + CollectiveAllReduceTest.collective_key_base,
+        op_instance_key_start=100 + CollectiveAllReduceTest.collective_key_base,
+        variable_instance_key_start=10000 +
         CollectiveAllReduceTest.collective_key_base)
     if local_mode:
       if num_gpus:
@@ -462,15 +472,23 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
         devices = ["/device:CPU:0"]
 
       if use_strategy_object:
-        strategy = collective_all_reduce_strategy.CollectiveAllReduceStrategy()
+        strategy = collective_all_reduce_strategy.CollectiveAllReduceStrategy(
+            communication=communication)
         strategy.extended._collective_keys = collective_keys
         strategy.extended._cross_device_ops._collective_keys = collective_keys
         return strategy, devices, ""
       else:
         collective_all_reduce_ops = cross_device_ops_lib.CollectiveAllReduce(
-            1, num_gpus, collective_keys=collective_keys)
+            1,
+            num_gpus,
+            collective_keys=collective_keys,
+            num_packs=num_packs,
+            communication=communication)
         return collective_all_reduce_ops, devices, ""
     else:
+      # NCCL requires physical GPUs for every replica, which we can't do with
+      # simulated multi host set up now.
+      assert communication != CollectiveCommunication.NCCL
       if num_gpus:
         devices = [
             "/job:%s/task:%d/replica:0/device:GPU:%d" % (task_type, task_id, i)
@@ -482,7 +500,8 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
         ]
 
       if use_strategy_object:
-        strategy = collective_all_reduce_strategy.CollectiveAllReduceStrategy()
+        strategy = collective_all_reduce_strategy.CollectiveAllReduceStrategy(
+            communication=communication)
         strategy.configure(
             cluster_spec=self._cluster_spec,
             task_type=task_type,
@@ -493,40 +512,30 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
                 "grpc://" + self._cluster_spec[task_type][task_id])
       else:
         collective_all_reduce_ops = cross_device_ops_lib.CollectiveAllReduce(
-            NUM_WORKERS, num_gpus, collective_keys=collective_keys)
+            NUM_WORKERS,
+            num_gpus,
+            collective_keys=collective_keys,
+            num_packs=num_packs,
+            communication=communication)
         return (collective_all_reduce_ops, devices,
                 "grpc://" + self._cluster_spec[task_type][task_id])
-
-  def _assert_values_equal(self, left, right, sess):
-    if isinstance(left, list):
-      for l, r in zip(left, right):
-        self._assert_values_equal(l, r, sess)
-    else:
-      self.assertEqual(type(left), type(right))
-      self.assertEqual(set(left.devices), set(right.devices))
-
-      run_options = config_pb2.RunOptions()
-      run_options.experimental.collective_graph_key = 6
-
-      left_values = np.array(
-          sess.run(list(left.values), options=run_options)).flatten()
-      right_values = np.array(list(right.values)).flatten()
-      self.assertEqual(len(left_values), len(right_values))
-      for l, r in zip(left_values, right_values):
-        self.assertEqual(l, r)
 
   def _test_reduction(self,
                       task_type,
                       task_id,
                       num_gpus,
+                      communication,
                       use_strategy_object=False,
-                      local_mode=False):
+                      local_mode=False,
+                      num_packs=1):
     collective_all_reduce, devices, master_target = self._get_test_objects(
         task_type,
         task_id,
         num_gpus,
+        communication=communication,
         use_strategy_object=use_strategy_object,
-        local_mode=local_mode)
+        local_mode=local_mode,
+        num_packs=num_packs)
     if local_mode:
       num_workers = 1
       worker_device = None
@@ -538,10 +547,6 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
     def _reduce(test_object, reduce_op, per_replica, destinations):
       if use_strategy_object:
         with test_object.scope():
-          # Mimic the behavior that distribution strategy usually strips the
-          # wrapper if there is only one value.
-          if len(per_replica.values) == 1:
-            per_replica = per_replica.values[0]
           return test_object.extended.reduce_to(reduce_op, per_replica,
                                                 destinations)
       else:
@@ -578,21 +583,21 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
 
       # test reduce()
       for destinations in all_destinations:
-        self._assert_values_equal(
+        self._assert_mirrored_equal(
             _reduce(
                 collective_all_reduce,
                 reduce_util.ReduceOp.MEAN,
                 per_replica,
                 destinations=destinations), _fake_mirrored(mean, destinations),
             sess)
-        self._assert_values_equal(
+        self._assert_mirrored_equal(
             _reduce(
                 collective_all_reduce,
                 reduce_util.ReduceOp.MEAN,
                 per_replica_2,
-                destinations=destinations), _fake_mirrored(
-                    mean_2, destinations), sess)
-        self._assert_values_equal(
+                destinations=destinations),
+            _fake_mirrored(mean_2, destinations), sess)
+        self._assert_mirrored_equal(
             _reduce(
                 collective_all_reduce,
                 reduce_util.ReduceOp.SUM,
@@ -600,7 +605,7 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
                 destinations=destinations),
             _fake_mirrored(mean * len(devices) * num_workers, destinations),
             sess)
-        self._assert_values_equal(
+        self._assert_mirrored_equal(
             _reduce(
                 collective_all_reduce,
                 reduce_util.ReduceOp.SUM,
@@ -611,12 +616,12 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
 
       # test batch_reduce()
       for d1, d2 in itertools.product(all_destinations, all_destinations):
-        self._assert_values_equal(
+        self._assert_mirrored_equal(
             _batch_reduce(collective_all_reduce, reduce_util.ReduceOp.MEAN,
                           [(per_replica, d1), (per_replica_2, d2)]),
             [_fake_mirrored(mean, d1),
              _fake_mirrored(mean_2, d2)], sess)
-        self._assert_values_equal(
+        self._assert_mirrored_equal(
             _batch_reduce(collective_all_reduce, reduce_util.ReduceOp.SUM,
                           [(per_replica, d1), (per_replica_2, d2)]),
             [
@@ -624,21 +629,31 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
                 _fake_mirrored(mean_2 * len(devices) * num_workers, d2)
             ], sess)
 
-    return True
-
-  def _get_indexed_slices(self, devices, start_i, as_per_replica=True):
+  def _get_indexed_slices(self,
+                          devices,
+                          start_i,
+                          variable_length,
+                          as_per_replica=True):
     dense_shape = [10, 2]
     values = ([[1., 2.]], [[3., 4.]], [[2., 1.]], [[0., 0.]], [[3., 1.]],
               [[2., 1.]])
     indices = ([1], [2], [3], [4], [5], [6])
+
+    # values and indices that have variable lengths.
+    vl_values = ([[1., 2.], [3., 4.]], [[3., 4.]], [[2., 1.]], [[0., 0.]],
+                 [[3., 1.], [2., 1.]], [[2., 1.]])
+    vl_indices = ([1, 2], [2], [3], [4], [5, 6], [6])
+
     indexed_slices = []
     for i, d in enumerate(devices):
       idx = i + start_i
       indexed_slices.append(
-          _make_indexed_slices(values[idx], indices[idx], dense_shape, d))
+          _make_indexed_slices(
+              vl_values[idx] if variable_length else values[idx],
+              vl_indices[idx] if variable_length else indices[idx], dense_shape,
+              d))
     if as_per_replica:
-      per_replica = value_lib.PerReplica(
-          value_lib.ReplicaDeviceMap(devices), indexed_slices)
+      per_replica = value_lib.PerReplica(indexed_slices)
       return per_replica
     else:
       return indexed_slices
@@ -647,10 +662,16 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
                                   task_type,
                                   task_id,
                                   num_gpus,
+                                  communication,
                                   batch_reduce,
+                                  variable_length,
                                   local_mode=False):
     collective_all_reduce, devices, master_target = self._get_test_objects(
-        task_type, task_id, num_gpus, local_mode=local_mode)
+        task_type,
+        task_id,
+        num_gpus,
+        communication=communication,
+        local_mode=local_mode)
     if local_mode:
       num_workers = 1
       worker_device = None
@@ -662,7 +683,8 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
          ops.device(worker_device), \
          self.cached_session(target=master_target) as sess:
       per_replica = self._get_indexed_slices(devices,
-                                             (task_id or 0) * max(num_gpus, 1))
+                                             (task_id or 0) * max(num_gpus, 1),
+                                             variable_length)
 
       if batch_reduce:
         result = collective_all_reduce.batch_reduce(
@@ -670,78 +692,96 @@ class CollectiveAllReduceTest(multi_worker_test_base.MultiWorkerTestBase,
       else:
         result = collective_all_reduce.reduce(reduce_util.ReduceOp.SUM,
                                               per_replica, per_replica)
-      self.assertIsInstance(result, value_lib.Mirrored)
+      if num_gpus > 1:
+        self.assertIsInstance(result, value_lib.Mirrored)
 
       run_options = config_pb2.RunOptions()
       run_options.experimental.collective_graph_key = 7
-      result = sess.run([ops.convert_to_tensor(v) for v in result.values],
-                        options=run_options)[0]
+      if num_gpus > 1:
+        result = sess.run([ops.convert_to_tensor(v) for v in result.values],
+                          options=run_options)[0]
+      else:
+        result = sess.run(ops.convert_to_tensor(result), options=run_options)
 
       # Reduce the same indexed slices on CPU locally as our expected results.
       devices_cpu = [(worker_device or "") + "/device:CPU:0"] * (
           max(num_gpus, 1) * num_workers)
       per_replica_on_cpu = self._get_indexed_slices(
-          devices_cpu, 0, as_per_replica=False)
+          devices_cpu, 0, variable_length, as_per_replica=False)
       expected_result = cross_device_utils.aggregate_tensors_or_indexed_slices(
           per_replica_on_cpu)
       expected_result = sess.run(ops.convert_to_tensor(expected_result))
 
       self.assertAllEqual(expected_result, result)
-      return True
 
   @combinations.generate(
       combinations.combine(
           mode=["graph"],
-          num_gpus=[0, 1, 2],
-          required_gpus=1,
-          use_strategy_object=[True, False]))
-  def testReductionDistributed(self, num_gpus, use_strategy_object):
-    if context.num_gpus() < num_gpus:
-      return
+          required_gpus=[0, 1, 2],
+          use_strategy_object=[True, False],
+          num_packs=[1, 2]))
+  def testReductionDistributed(self, required_gpus, use_strategy_object,
+                               num_packs):
     self._run_between_graph_clients(
         self._test_reduction,
         self._cluster_spec,
-        num_gpus,
-        use_strategy_object=use_strategy_object)
+        required_gpus,
+        communication=CollectiveCommunication.RING,
+        use_strategy_object=use_strategy_object,
+        num_packs=num_packs)
 
   @combinations.generate(
       combinations.combine(
           mode=["graph"],
-          num_gpus=[0, 1, 2],
-          required_gpus=1,
-          batch_reduce=[True]))
-  def testReduceIndexedSlicesDistributed(self, num_gpus, batch_reduce):
-    if context.num_gpus() < num_gpus:
-      return
-    self._run_between_graph_clients(self._test_reduce_indexed_slices,
-                                    self._cluster_spec, num_gpus, batch_reduce)
+          required_gpus=[0, 1, 2],
+          variable_length=[True, False]))
+  def testReduceIndexedSlicesDistributed(self, required_gpus, variable_length):
+    self._run_between_graph_clients(
+        self._test_reduce_indexed_slices,
+        self._cluster_spec,
+        required_gpus,
+        communication=CollectiveCommunication.RING,
+        batch_reduce=True,
+        variable_length=variable_length)
 
   # Collective ops doesn't support strategy with one device.
   @combinations.generate(
       combinations.combine(
           mode=["graph"],
-          num_gpus=[2],
           required_gpus=2,
+          communication=[
+              CollectiveCommunication.NCCL, CollectiveCommunication.RING
+          ],
           use_strategy_object=[True, False]))
-  def testReductionLocal(self, num_gpus, use_strategy_object):
-    if context.num_gpus() < num_gpus:
-      return
+  def testReductionLocal(self, required_gpus, communication,
+                         use_strategy_object):
     self._test_reduction(
         None,
         None,
-        num_gpus,
+        required_gpus,
+        communication=communication,
         use_strategy_object=use_strategy_object,
         local_mode=True)
 
   @combinations.generate(
       combinations.combine(
           mode=["graph"],
-          num_gpus=[2],
           required_gpus=2,
-          batch_reduce=[True, False]))
-  def testReduceIndexedSlicesLocal(self, num_gpus, batch_reduce):
+          batch_reduce=[True, False],
+          variable_length=[True, False],
+          communication=[
+              CollectiveCommunication.NCCL, CollectiveCommunication.RING
+          ]))
+  def testReduceIndexedSlicesLocal(self, required_gpus, batch_reduce,
+                                   variable_length, communication):
     self._test_reduce_indexed_slices(
-        None, None, num_gpus, batch_reduce, local_mode=True)
+        None,
+        None,
+        required_gpus,
+        communication=communication,
+        batch_reduce=batch_reduce,
+        variable_length=variable_length,
+        local_mode=True)
 
 
 if __name__ == "__main__":

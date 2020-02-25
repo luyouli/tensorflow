@@ -156,8 +156,8 @@ class ClipTest(test.TestCase):
       indices = constant_op.constant(indices)
       shape = constant_op.constant(shape)
       # IndexedSlices mode
-      indixed_slices = ops.IndexedSlices(values, indices, shape)
-      clipped = clip_ops.clip_by_value(indixed_slices, clip_value_min,
+      indexed_slices = ops.IndexedSlices(values, indices, shape)
+      clipped = clip_ops.clip_by_value(indexed_slices, clip_value_min,
                                        clip_value_max)
       # clipped should be IndexedSlices
       self.assertIsInstance(clipped, ops.IndexedSlices)
@@ -486,7 +486,7 @@ class ClipTest(test.TestCase):
 
   def testClipByAverageNormReplacedWithClipByNorm(self):
     # Check clip_by_average_norm(t) is the same as
-    # clip_by_norm(t, clip_norm * tf.to_float(tf.size(t)))
+    # clip_by_norm(t, clip_norm * tf.compat.v1.to_float(tf.size(t)))
     with self.session(use_gpu=True):
       x = constant_op.constant([-3.0, 0.0, 0.0, 4.0, 0.0, 0.0], shape=[2, 3])
       # Average norm of x = sqrt(3^2 + 4^2) / 6 = 0.83333333

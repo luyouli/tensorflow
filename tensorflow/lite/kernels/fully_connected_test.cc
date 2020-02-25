@@ -14,6 +14,9 @@ limitations under the License.
 ==============================================================================*/
 // Unit test for TFLite FULLY_CONNECTED op.
 
+#include "tensorflow/lite/kernels/fully_connected.h"
+
+#include <initializer_list>
 #include <iomanip>
 #include <random>
 #include <vector>
@@ -28,17 +31,6 @@ limitations under the License.
 #include "tensorflow/lite/model.h"
 
 namespace tflite {
-
-namespace ops {
-namespace builtin {
-
-TfLiteRegistration* Register_FULLY_CONNECTED_REF();
-TfLiteRegistration* Register_FULLY_CONNECTED_GENERIC_OPT();
-TfLiteRegistration* Register_FULLY_CONNECTED_PIE();
-
-}  // namespace builtin
-}  // namespace ops
-
 namespace {
 
 using ::testing::ElementsAre;
@@ -136,10 +128,11 @@ class BaseFullyConnectedOpModel : public SingleOpModel {
   BaseFullyConnectedOpModel(
       TfLiteRegistration* registration, int units, int batches,
       const TensorData& input, const TensorData& output = {TensorType_FLOAT32},
-      bool bias_tensor_optional = false,
+      bool keep_num_dims = false, bool bias_tensor_optional = false,
       ActivationFunctionType activation_func = ActivationFunctionType_RELU,
       FullyConnectedOptionsWeightsFormat weights_format =
-          FullyConnectedOptionsWeightsFormat_DEFAULT)
+          FullyConnectedOptionsWeightsFormat_DEFAULT,
+      bool add_bias_for_quantized = true)
       : batches_(batches), units_(units) {
     int total_input_size = 1;
     for (size_t i = 0; i < input.shape.size(); ++i) {
@@ -148,20 +141,29 @@ class BaseFullyConnectedOpModel : public SingleOpModel {
     input_size_ = total_input_size / batches_;
 
     input_ = AddInput(input);
-    weights_ =
-        AddInput({input.type, {units_, input_size_}, input.min, input.max});
+    if (input.type == TensorType_INT16) {
+      weights_ = AddInput({TensorType_INT8, {units_, input_size_}, -63.5, 64});
+    } else {
+      weights_ =
+          AddInput({input.type, {units_, input_size_}, input.min, input.max});
+    }
 
     if (bias_tensor_optional) {
       bias_ = AddNullInput();
     } else if (input.type == TensorType_FLOAT32) {
       bias_ = AddInput({TensorType_FLOAT32, {units_}});
-    } else {
+    } else if (add_bias_for_quantized) {
       // This is a quantized version. The scale of 'bias' depends on the scales
       // of input and filter. Supposedly this is correctly set during quantized
       // training.
       auto bias_scale = GetScale(input_) * GetScale(weights_);
-      TensorData bias{TensorType_INT32, {units_}, 0, 0, bias_scale};
-      bias_ = AddInput(bias);
+      if (input.type == TensorType_INT16) {
+        TensorData bias{TensorType_INT64, {units_}, 0, 0, bias_scale};
+        bias_ = AddInput(bias);
+      } else {
+        TensorData bias{TensorType_INT32, {units_}, 0, 0, bias_scale};
+        bias_ = AddInput(bias);
+      }
     }
 
     output_ = AddOutput(output);
@@ -169,15 +171,20 @@ class BaseFullyConnectedOpModel : public SingleOpModel {
       AddOutput({TensorType_UINT8, input.shape});
     }
 
-    SetBuiltinOp(
-        BuiltinOperator_FULLY_CONNECTED, BuiltinOptions_FullyConnectedOptions,
-        CreateFullyConnectedOptions(builder_, activation_func, weights_format)
-            .Union());
+    SetBuiltinOp(BuiltinOperator_FULLY_CONNECTED,
+                 BuiltinOptions_FullyConnectedOptions,
+                 CreateFullyConnectedOptions(builder_, activation_func,
+                                             weights_format, keep_num_dims)
+                     .Union());
     resolver_ = absl::make_unique<SingleOpResolver>(
         BuiltinOperator_FULLY_CONNECTED, registration);
-    BuildInterpreter(
-        {GetShape(input_), GetShape(weights_),
-         (bias_ == kOptionalTensor) ? std::vector<int>() : GetShape(bias_)});
+    std::vector<std::vector<int>> inputs = {GetShape(input_),
+                                            GetShape(weights_)};
+    if (add_bias_for_quantized) {
+      inputs.push_back((bias_ == kTfLiteOptionalTensor) ? std::vector<int>()
+                                                        : GetShape(bias_));
+    }
+    BuildInterpreter(inputs);
   }
 
   int input_size() { return input_size_; }
@@ -211,6 +218,7 @@ class FloatFullyConnectedOpModel : public BaseFullyConnectedOpModel {
   }
 
   std::vector<float> GetOutput() { return ExtractVector<float>(output_); }
+  std::vector<int> GetOutputShape() { return GetTensorShape(output_); }
 };
 
 class QuantizedFullyConnectedOpModel : public BaseFullyConnectedOpModel {
@@ -219,6 +227,9 @@ class QuantizedFullyConnectedOpModel : public BaseFullyConnectedOpModel {
 
   void SetBias(const std::vector<float>& data) {
     QuantizeAndPopulate<int32_t>(bias_, data);
+  }
+  void SetBias64(const std::vector<float>& data) {
+    QuantizeAndPopulate<int64_t>(bias_, data);
   }
   template <typename T>
   void SetWeights(const std::vector<float>& data) {
@@ -311,6 +322,7 @@ class HybridFullyConnectedOpModel : public SingleOpModel {
 
   void SetInput(const std::vector<float>& f) { PopulateTensor(input_, f); }
   std::vector<float> GetOutput() { return ExtractVector<float>(output_); }
+  std::vector<int> GetOutputShape() { return GetTensorShape(output_); }
 
   int input_size() { return input_size_; }
   int num_units() { return units_; }
@@ -343,6 +355,11 @@ class FloatFullyConnectedOpTest : public SingleOpTest {
 const auto kKernelMapNoPie = new std::map<string, TfLiteRegistration*>({
     {"Reference", ops::builtin::Register_FULLY_CONNECTED_REF()},
     {"GenericOptimized", ops::builtin::Register_FULLY_CONNECTED_GENERIC_OPT()},
+});
+
+const auto kKernelMapSparse = new std::map<string, TfLiteRegistration*>({
+    {"SparseReference", ops::builtin::Register_FULLY_CONNECTED_SPARSE_REF()},
+    {"SparseOptimized", ops::builtin::Register_FULLY_CONNECTED_SPARSE_OPT()},
 });
 
 class QuantizedFullyConnectedOpTest : public SingleOpTest {
@@ -386,6 +403,7 @@ TEST_P(FloatFullyConnectedOpTest, SimpleTest) {
 
   m.Invoke();
 
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 3));
   EXPECT_THAT(m.GetOutput(), ElementsAre(24, 25, 26, 58, 59, 60));
 }
 
@@ -404,6 +422,7 @@ TEST_P(FloatFullyConnectedOpTest, SimpleTest2) {
 
   m.Invoke();
 
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 1));
   EXPECT_THAT(m.GetOutput(), ElementsAre(11, 9));
 }
 
@@ -413,6 +432,7 @@ TEST(FloatFullyConnectedOpTest, SimpleTestNoBias) {
                                /*units=*/1, /*batches=*/2,
                                /*input=*/{TensorType_FLOAT32, {2, 2}},
                                /*output=*/{TensorType_FLOAT32},
+                               /*keep_num_dims=*/false,
                                /*bias_tensor_optional=*/true);
   m.SetWeights({
       2, 4,  // u = 0
@@ -425,6 +445,7 @@ TEST(FloatFullyConnectedOpTest, SimpleTestNoBias) {
 
   m.Invoke();
 
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 1));
   EXPECT_THAT(m.GetOutput(), ElementsAre(10, 8));
 }
 
@@ -458,6 +479,40 @@ TEST_P(QuantizedFullyConnectedOpTest, SimpleTestQuantizedUint8) {
               ElementsAre(151, 152, 153, 185, 186, 187));
 }
 
+TEST_P(QuantizedFullyConnectedOpTest, SimpleTestQuantizedUint8NoBias) {
+  QuantizedFullyConnectedOpModel m(
+      GetRegistration(), /*units=*/3, /*batches*/ 2,
+      /*input=*/{TensorType_UINT8, {2, 10}, -63.5, 64},
+      /*output=*/{TensorType_UINT8, {}, -127, 128},
+      /*keep_num_dims =*/false, /*bool bias_tensor_optional =*/false,
+      /*ActivationFunctionType activation_func =*/ActivationFunctionType_RELU,
+      /*FullyConnectedOptionsWeightsFormat weights_format =*/
+      FullyConnectedOptionsWeightsFormat_DEFAULT,
+      /*add_bias_for_quantized =*/false);
+
+  // input_product_scale < output_scale was not true.
+  m.SetWeights<uint8_t>({
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 0
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 1
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 2
+  });
+
+  m.SetInput<uint8_t>({
+      1, 2, 3, 4, 5, 6, 7, 8,  -9, -10,  // b = 0
+      1, 2, 3, 4, 5, 6, 7, -8, 9,  -10,  // b = 1
+  });
+
+  m.Invoke();
+
+  EXPECT_THAT(m.GetDequantizedOutput<uint8_t>(),
+              ElementsAreArray(ArrayFloatNear({
+                  23, 23, 23,  //
+                  57, 57, 57,  //
+              })));
+  EXPECT_THAT(m.GetOutput<uint8_t>(),
+              ElementsAre(150, 150, 150, 184, 184, 184));
+}
+
 TEST_P(QuantizedFullyConnectedOpTest, SimpleTestQuantizedInt8) {
   QuantizedFullyConnectedOpModel m(
       GetRegistration(), /*units=*/3, /*batches*/ 2,
@@ -482,6 +537,64 @@ TEST_P(QuantizedFullyConnectedOpTest, SimpleTestQuantizedInt8) {
   EXPECT_THAT(m.GetDequantizedOutput<int8_t>(),
               ElementsAreArray(ArrayFloatNear({24, 25, 26, 58, 59, 60})));
   EXPECT_THAT(m.GetOutput<int8_t>(), ElementsAre(23, 24, 25, 57, 58, 59));
+}
+
+TEST_P(QuantizedFullyConnectedOpTest, SimpleTestQuantizedInt16) {
+  const float scale = 128.0 / 65536;
+  QuantizedFullyConnectedOpModel m(
+      GetRegistration(), /*units=*/3, /*batches*/ 2,
+      /*input=*/{TensorType_INT16, {2, 10}, 0, 0, scale, 0},
+      /*output=*/{TensorType_INT16, {}, 0, 0, scale, 0});
+
+  // input_product_scale < output_scale was not true.
+  m.SetWeights<int8_t>({
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 0
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 1
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 2
+  });
+  m.SetBias64({1, 2, 3});
+
+  m.SetInput<int16_t>({
+      1, 2, 3, 4, 5, 6, 7, 8,  -9, -10,  // b = 0
+      1, 2, 3, 4, 5, 6, 7, -8, 9,  -10,  // b = 1
+  });
+
+  m.Invoke();
+
+  EXPECT_THAT(m.GetDequantizedOutput<int16_t>(),
+              ElementsAreArray(ArrayFloatNear({24, 25, 26, 58, 59, 60})));
+  EXPECT_THAT(m.GetOutput<int16_t>(),
+              ElementsAre(12288, 12800, 13312, 29696, 30208, 30720));
+}
+
+TEST_P(QuantizedFullyConnectedOpTest, SimpleTestQuantizedInt8NoBias) {
+  QuantizedFullyConnectedOpModel m(
+      GetRegistration(), /*units=*/3, /*batches*/ 2,
+      /*input=*/{TensorType_INT8, {2, 10}, -63.5, 64},
+      /*output=*/{TensorType_INT8, {}, -127, 128},
+      /*keep_num_dims =*/false, /*bool bias_tensor_optional =*/false,
+      /*ActivationFunctionType activation_func =*/ActivationFunctionType_RELU,
+      /*FullyConnectedOptionsWeightsFormat weights_format =*/
+      FullyConnectedOptionsWeightsFormat_DEFAULT,
+      /*add_bias_for_quantized =*/false);
+
+  // input_product_scale < output_scale was not true.
+  m.SetWeights<int8_t>({
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 0
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 1
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 2
+  });
+
+  m.SetInput<int8_t>({
+      1, 2, 3, 4, 5, 6, 7, 8,  -9, -10,  // b = 0
+      1, 2, 3, 4, 5, 6, 7, -8, 9,  -10,  // b = 1
+  });
+
+  m.Invoke();
+
+  EXPECT_THAT(m.GetDequantizedOutput<int8_t>(),
+              ElementsAreArray(ArrayFloatNear({23, 23, 23, 57, 57, 57})));
+  EXPECT_THAT(m.GetOutput<int8_t>(), ElementsAre(22, 22, 22, 56, 56, 56));
 }
 
 // Test the GEMV path.
@@ -591,6 +704,7 @@ void SimpleTestQuantizedInt16OutputCase(
       /*input=*/
       {TensorType_UINT8, {batches, input_depth}, kInputMin, kInputMax},
       /*output=*/{TensorType_INT16, {}, kOutputMin, kOutputMax},
+      /*keep_num_dims=*/false,
       /*bias_tensor_optional=*/false,
       /*activation_func=*/ActivationFunctionType_NONE, weights_format);
 
@@ -700,7 +814,8 @@ TEST(HybridFullyConnectedOpTest, SimpleTestQuantizedUint8) {
   HybridFullyConnectedOpModel m(
       /*units=*/3, /*batches=*/2,
       /*input=*/{TensorType_FLOAT32, {2, 10}},
-      /*weights=*/{TensorType_UINT8, {3, 10}, -63.5, 64});  // Hybrid
+      /*weights=*/
+      {TensorType_UINT8, {3, 10}, 0, 0, 10.0 / 127.0, 0});  // Hybrid
 
   m.SetWeights({
       1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 0
@@ -728,7 +843,7 @@ TEST(HybridFullyConnectedOpTest, SimpleTestQuantizedInt8) {
   HybridFullyConnectedOpModel m(
       /*units=*/3, /*batches=*/2,
       /*input=*/{TensorType_FLOAT32, {2, 10}},
-      /*weights=*/{TensorType_INT8, {3, 10}, -63.5, 64});  // Hybrid
+      /*weights=*/{TensorType_INT8, {3, 10}, 0, 0, 10.0 / 127.0, 0});  // Hybrid
 
   m.SetSignedWeights({
       1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 0
@@ -773,11 +888,59 @@ TEST_P(FloatFullyConnectedOpTest, SimpleTest4DInput) {
 
   m.Invoke();
 
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 3));
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
                                  24, 25, 26,  // first batch
                                  58, 59, 60,  // second batch
                              }));
 }
+
+TEST_P(FloatFullyConnectedOpTest, SimpleTest4DInput4DOutput) {
+  // Note that it is not required that the first dimension be the number of
+  // batches. All we care is that the input can be evenly distributed in
+  // batches. In this case, we need the input to have multiples of '2'.
+  FloatFullyConnectedOpModel m(GetRegistration(),
+                               /*units=*/3, /*batches=*/2,
+                               /*input=*/{TensorType_FLOAT32, {1, 2, 1, 10}},
+                               /*output=*/{TensorType_FLOAT32},
+                               /*keep_num_dims=*/true);
+  m.SetWeights({
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 0
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 1
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 2
+  });
+  m.SetBias({1, 2, 3});
+
+  m.SetInput({
+      1, 2, 3, 4, 5, 6, 7, 8,  -9, -10,  // first batch
+      1, 2, 3, 4, 5, 6, 7, -8, 9,  -10,  // second batch
+  });
+
+  m.Invoke();
+
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 2, 1, 3));
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({
+                                 24, 25, 26,  // first batch
+                                 58, 59, 60,  // second batch
+                             }));
+}
+
+#ifdef GTEST_HAS_DEATH_TEST
+TEST_P(FloatFullyConnectedOpTest, SimpleTest4DInputInvalidShape) {
+  // Note that it is not required that the first dimension be the number of
+  // batches. But it is required that the last dimension is the 'input_dim'.
+  //
+  // For this particular test, it is required for the output to be reformattable
+  // into a shape of form {4, 1, 5, ?} but since the output size (the product of
+  // output dimensions: units times batches) is 6, this is not possible.
+  EXPECT_DEATH(FloatFullyConnectedOpModel m(
+                   GetRegistration(), /*units=*/3, /*batches=*/2,
+                   /*input=*/{TensorType_FLOAT32, {4, 1, 5, 1}},
+                   /*output=*/{TensorType_FLOAT32},
+                   /*keep_num_dims=*/true),
+               "Cannot allocate tensors");
+}
+#endif
 
 TEST_P(QuantizedFullyConnectedOpTest, SimpleTest4dInputQuantizedUint8) {
   QuantizedFullyConnectedOpModel m(
@@ -903,11 +1066,113 @@ TEST_P(FloatFullyConnectedOpTest, BlackBoxTest) {
   }
 }
 
+template <typename T>
+class SparseFullyConnectedOpModel : public SingleOpModel {
+ public:
+  SparseFullyConnectedOpModel(TfLiteRegistration* registration, int units,
+                              int batches, const TensorData& input,
+                              std::initializer_list<int> weights_shape,
+                              std::initializer_list<T> weights_data)
+      : batches_(batches), units_(units) {
+    int total_input_size = 1;
+    for (size_t i = 0; i < input.shape.size(); ++i) {
+      total_input_size *= input.shape[i];
+    }
+    input_size_ = total_input_size / batches_;
+
+    input_ = AddInput(input);
+    weights_ = AddConstSparseInput(input.type, weights_shape, weights_data);
+
+    TensorData bias{input.type, {units_}};
+    bias_ = AddInput(bias);
+
+    output_ = AddOutput({input.type});
+
+    SetBuiltinOp(
+        BuiltinOperator_FULLY_CONNECTED, BuiltinOptions_FullyConnectedOptions,
+        CreateFullyConnectedOptions(builder_, ActivationFunctionType_RELU)
+            .Union());
+    resolver_ = absl::make_unique<SingleOpResolver>(
+        BuiltinOperator_FULLY_CONNECTED, registration);
+    BuildInterpreter({GetShape(input_), GetShape(weights_), GetShape(bias_)});
+  }
+  void SetBias(const std::vector<T>& data) { PopulateTensor(bias_, data); }
+  void SetInput(const std::vector<T>& data) { PopulateTensor(input_, data); }
+  std::vector<T> GetOutput() { return ExtractVector<T>(output_); }
+  std::vector<int> GetOutputShape() { return GetTensorShape(output_); }
+
+  int input_size() { return input_size_; }
+  int num_units() { return units_; }
+  int num_batches() { return batches_; }
+
+ protected:
+  int input_;
+  int weights_;
+  int bias_;
+  int output_;
+
+  int batches_;
+  int units_;
+  int input_size_;
+};
+
+class SparseFullyConnectedOpTest : public SingleOpTest {
+ protected:
+  const std::map<string, TfLiteRegistration*>& GetKernelMap() override {
+    return *kKernelMapSparse;
+  }
+};
+
+TEST_P(SparseFullyConnectedOpTest, SimpleTest) {
+  std::initializer_list<int> weight_shape = {3, 10};
+  std::initializer_list<float> weight_data = {
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 0
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 1
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,  // u = 2
+  };
+  SparseFullyConnectedOpModel<float> m(
+      GetRegistration(), /*units=*/3, /*batches=*/2,
+      /*input=*/{TensorType_FLOAT32, {2, 10}}, weight_shape, weight_data);
+  m.SetBias({1, 2, 3});
+
+  m.SetInput({
+      1, 2, 3, 4, 5, 6, 7, 8,  -9, -10,  // b = 0
+      1, 2, 3, 4, 5, 6, 7, -8, 9,  -10,  // b = 1
+  });
+
+  m.Invoke();
+
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 3));
+  EXPECT_THAT(m.GetOutput(), ElementsAre(24, 25, 26, 58, 59, 60));
+}
+
+TEST_P(SparseFullyConnectedOpTest, SimpleTest2) {
+  std::initializer_list<int> weight_shape = {1, 2};
+  std::initializer_list<float> weight_data = {
+      2, 4  // u = 0
+  };
+  SparseFullyConnectedOpModel<float> m(
+      GetRegistration(), /*units=*/1, /*batches=*/2,
+      /*input=*/{TensorType_FLOAT32, {2, 2}}, weight_shape, weight_data);
+  m.SetBias({1});
+
+  m.SetInput({
+      1, 2,  // b = 0
+      2, 1   // b = 1
+  });
+
+  m.Invoke();
+
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 1));
+  EXPECT_THAT(m.GetOutput(), ElementsAre(11, 9));
+}
+
+// TODO(b/148391360): Add tests for unsupported sparsity format.
+// TEST_P(SparseFullyConnectedOpTest, TestUnsupportedSparsityFormat)
+
+INSTANTIATE_TEST_SUITE_P(
+    SparseFullyConnectedOpTest, SparseFullyConnectedOpTest,
+    ::testing::ValuesIn(SingleOpTest::GetKernelTags(*kKernelMapSparse)));
+
 }  // namespace
 }  // namespace tflite
-
-int main(int argc, char** argv) {
-  ::tflite::LogToStderr();
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

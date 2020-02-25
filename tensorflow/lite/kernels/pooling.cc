@@ -12,6 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include "tensorflow/lite/kernels/internal/optimized/integer_ops/pooling.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -20,8 +22,7 @@ limitations under the License.
 #include <limits>
 
 #include "tensorflow/lite/c/builtin_op_data.h"
-#include "tensorflow/lite/c/c_api_internal.h"
-#include "tensorflow/lite/kernels/internal/optimized/integer_ops/pooling.h"
+#include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/kernels/internal/optimized/optimized_ops.h"
 #include "tensorflow/lite/kernels/internal/reference/integer_ops/pooling.h"
 #include "tensorflow/lite/kernels/internal/reference/reference_ops.h"
@@ -81,24 +82,12 @@ TfLiteStatus GenericPrepare(TfLiteContext* context, TfLiteNode* node) {
 
   // Matching GetWindowedOutputSize in TensorFlow.
   auto padding = params->padding;
-  auto compute_out_size = [padding](int image_size, int filter_size,
-                                    int stride) -> int {
-    return padding == kTfLitePaddingSame
-               ? (image_size + stride - 1) / stride
-               : padding == kTfLitePaddingValid
-                     ? (image_size - filter_size + stride) / stride
-                     : 0;
-  };
+  int out_width, out_height;
 
-  int out_width =
-      compute_out_size(width, params->filter_width, params->stride_width);
-  int out_height =
-      compute_out_size(height, params->filter_height, params->stride_height);
-
-  data->padding.height = ComputePadding(params->stride_height, 1, height,
-                                        params->filter_height, out_height);
-  data->padding.width = ComputePadding(params->stride_width, 1, width,
-                                       params->filter_width, out_width);
+  data->padding = ComputePaddingHeightWidth(
+      params->stride_height, params->stride_width, 1, 1, height, width,
+      params->filter_height, params->filter_width, padding, &out_height,
+      &out_width);
 
   if (input->type == kTfLiteUInt8 || input->type == kTfLiteInt8) {
     if (pool_type == kAverage || pool_type == kMax) {
@@ -155,8 +144,8 @@ void AverageEvalQuantizedUint8(TfLiteContext* context, TfLiteNode* node,
                                TfLiteTensor* output) {
   int32_t activation_min;
   int32_t activation_max;
-  CalculateActivationRangeUint8(params->activation, output, &activation_min,
-                                &activation_max);
+  (void)CalculateActivationRangeQuantized(context, params->activation, output,
+                                          &activation_min, &activation_max);
 #define TF_LITE_AVERAGE_POOL(type)                                         \
   tflite::PoolParams op_params;                                            \
   op_params.stride_height = params->stride_height;                         \
@@ -184,8 +173,9 @@ void AverageEvalQuantizedInt8(TfLiteContext* context, TfLiteNode* node,
                               const TfLiteTensor* input, TfLiteTensor* output) {
   int32_t activation_min;
   int32_t activation_max;
-  CalculateActivationRangeInt8(params->activation, output, &activation_min,
-                               &activation_max);
+
+  (void)CalculateActivationRangeQuantized(context, params->activation, output,
+                                          &activation_min, &activation_max);
 #define TF_LITE_AVERAGE_POOL(type)                                        \
   tflite::PoolParams op_params;                                           \
   op_params.stride_height = params->stride_height;                        \
@@ -240,8 +230,8 @@ void MaxEvalQuantizedUInt8(TfLiteContext* context, TfLiteNode* node,
                            const TfLiteTensor* input, TfLiteTensor* output) {
   int32_t activation_min;
   int32_t activation_max;
-  CalculateActivationRangeUint8(params->activation, output, &activation_min,
-                                &activation_max);
+  (void)CalculateActivationRangeQuantized(context, params->activation, output,
+                                          &activation_min, &activation_max);
 #define TF_LITE_MAX_POOL(type)                                         \
   tflite::PoolParams op_params;                                        \
   op_params.stride_height = params->stride_height;                     \
@@ -269,8 +259,8 @@ void MaxEvalQuantizedInt8(TfLiteContext* context, TfLiteNode* node,
                           const TfLiteTensor* input, TfLiteTensor* output) {
   int32_t activation_min;
   int32_t activation_max;
-  CalculateActivationRangeInt8(params->activation, output, &activation_min,
-                               &activation_max);
+  (void)CalculateActivationRangeQuantized(context, params->activation, output,
+                                          &activation_min, &activation_max);
 #define TF_LITE_MAX_POOL(type)                                        \
   tflite::PoolParams op_params;                                       \
   op_params.stride_height = params->stride_height;                    \

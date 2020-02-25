@@ -33,6 +33,7 @@ from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import test_util
 from tensorflow.python.keras import backend as keras_backend
 from tensorflow.python.keras import initializers
+from tensorflow.python.keras.engine import base_layer_utils
 from tensorflow.python.keras.layers import kernelized as kernel_layers
 from tensorflow.python.keras.utils import kernelized_utils
 from tensorflow.python.ops import array_ops
@@ -89,7 +90,7 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
     with self.assertRaisesRegexp(
         ValueError,
         r'The rank of the input tensor should be 2. Got 3 instead.'):
-      _ = rff_layer.apply(inputs)
+      _ = rff_layer(inputs)
 
   @parameterized.named_parameters(
       ('gaussian', 'gaussian', 10.0, False),
@@ -122,10 +123,6 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
     self.assertListEqual([3, 10], outputs.shape.as_list())
     num_trainable_vars = 1 if trainable else 0
     self.assertLen(rff_layer.non_trainable_variables, 3 - num_trainable_vars)
-    if not context.executing_eagerly():
-      self.assertLen(
-          ops.get_collection(ops.GraphKeys.TRAINABLE_VARIABLES),
-          num_trainable_vars)
 
   @test_util.assert_no_new_pyobjects_executing_eagerly
   def test_no_eager_Leak(self):
@@ -146,32 +143,32 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
   @parameterized.named_parameters(
       ('gaussian', 'gaussian'), ('laplacian', 'laplacian'),
       ('other', init_ops.random_uniform_initializer))
-  @test_util.run_deprecated_v1
   def test_call_on_placeholder(self, initializer):
-    inputs = array_ops.placeholder(dtype=dtypes.float32, shape=[None, None])
-    rff_layer = kernel_layers.RandomFourierFeatures(
-        output_dim=5,
-        kernel_initializer=initializer,
-        name='random_fourier_features')
-    with self.assertRaisesRegexp(
-        ValueError, r'The last dimension of the inputs to '
-        '`RandomFourierFeatures` should be defined. Found `None`.'):
-      rff_layer(inputs)
+    with ops.Graph().as_default():
+      inputs = array_ops.placeholder(dtype=dtypes.float32, shape=[None, None])
+      rff_layer = kernel_layers.RandomFourierFeatures(
+          output_dim=5,
+          kernel_initializer=initializer,
+          name='random_fourier_features')
+      with self.assertRaisesRegexp(
+          ValueError, r'The last dimension of the inputs to '
+          '`RandomFourierFeatures` should be defined. Found `None`.'):
+        rff_layer(inputs)
 
-    inputs = array_ops.placeholder(dtype=dtypes.float32, shape=[2, None])
-    rff_layer = kernel_layers.RandomFourierFeatures(
-        output_dim=5,
-        kernel_initializer=initializer,
-        name='random_fourier_features')
-    with self.assertRaisesRegexp(
-        ValueError, r'The last dimension of the inputs to '
-        '`RandomFourierFeatures` should be defined. Found `None`.'):
-      rff_layer(inputs)
+      inputs = array_ops.placeholder(dtype=dtypes.float32, shape=[2, None])
+      rff_layer = kernel_layers.RandomFourierFeatures(
+          output_dim=5,
+          kernel_initializer=initializer,
+          name='random_fourier_features')
+      with self.assertRaisesRegexp(
+          ValueError, r'The last dimension of the inputs to '
+          '`RandomFourierFeatures` should be defined. Found `None`.'):
+        rff_layer(inputs)
 
-    inputs = array_ops.placeholder(dtype=dtypes.float32, shape=[None, 3])
-    rff_layer = kernel_layers.RandomFourierFeatures(
-        output_dim=5, name='random_fourier_features')
-    rff_layer(inputs)
+      inputs = array_ops.placeholder(dtype=dtypes.float32, shape=[None, 3])
+      rff_layer = kernel_layers.RandomFourierFeatures(
+          output_dim=5, name='random_fourier_features')
+      rff_layer(inputs)
 
   @parameterized.named_parameters(('gaussian', 10, 'gaussian', 2.0),
                                   ('laplacian', 5, 'laplacian', None),
@@ -218,13 +215,15 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
     if isinstance(initializer, init_ops.Initializer):
       expected_initializer = initializers.serialize(initializer)
 
+    expected_dtype = (
+        'float32' if base_layer_utils.v2_dtype_behavior_enabled() else None)
     expected_config = {
         'output_dim': output_dim,
         'kernel_initializer': expected_initializer,
         'scale': scale,
         'name': 'random_fourier_features',
         'trainable': trainable,
-        'dtype': None,
+        'dtype': expected_dtype,
     }
     self.assertLen(expected_config, len(rff_layer.get_config()))
     self.assertSameElements(
@@ -258,10 +257,6 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
       self.assertEqual('random_fourier_features/random_features_scale:0',
                        rff_layer.trainable_variables[0].name)
     self.assertLen(rff_layer.non_trainable_variables, 3 - num_trainable_vars)
-    if not context.executing_eagerly():
-      self.assertLen(
-          ops.get_collection(ops.GraphKeys.TRAINABLE_VARIABLES),
-          num_trainable_vars)
 
   @parameterized.named_parameters(
       ('gaussian', 10, 'gaussian', 3.0, True),
@@ -279,8 +274,8 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
         name='random_fourier_features')
     inputs = constant_op.constant(
         np.random.uniform(low=-1.0, high=1.0, size=(2, 4)))
-    output1 = rff_layer.apply(inputs)
-    output2 = rff_layer.apply(inputs)
+    output1 = rff_layer(inputs)
+    output2 = rff_layer(inputs)
     self._assert_all_close(output1, output2)
 
   @parameterized.named_parameters(
@@ -304,10 +299,10 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
     y = constant_op.constant([[-1.0, 1.0, 1.0]])
 
     # Apply both layers to both inputs.
-    output_x1 = math.sqrt(2.0 / 3000.0) * rff_layer1.apply(x)
-    output_y1 = math.sqrt(2.0 / 3000.0) * rff_layer1.apply(y)
-    output_x2 = math.sqrt(2.0 / 2000.0) * rff_layer2.apply(x)
-    output_y2 = math.sqrt(2.0 / 2000.0) * rff_layer2.apply(y)
+    output_x1 = math.sqrt(2.0 / 3000.0) * rff_layer1(x)
+    output_y1 = math.sqrt(2.0 / 3000.0) * rff_layer1(y)
+    output_x2 = math.sqrt(2.0 / 2000.0) * rff_layer2(x)
+    output_y2 = math.sqrt(2.0 / 2000.0) * rff_layer2(y)
 
     # Compute the inner products of the outputs (on inputs x and y) for both
     # layers. For any fixed random features layer rff_layer, and inputs x, y,
@@ -336,8 +331,8 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
         name='random_fourier_features')
 
     # Apply layer to both inputs.
-    output_x = math.sqrt(2.0 / small_output_dim) * rff_layer.apply(x)
-    output_y = math.sqrt(2.0 / small_output_dim) * rff_layer.apply(y)
+    output_x = math.sqrt(2.0 / small_output_dim) * rff_layer(x)
+    output_y = math.sqrt(2.0 / small_output_dim) * rff_layer(y)
 
     # The inner products of the outputs (on inputs x and y) approximates the
     # real value of the RBF kernel but poorly since the output dimension of the
@@ -381,8 +376,8 @@ class RandomFourierFeaturesTest(test.TestCase, parameterized.TestCase):
 
     # The shapes of output_x and output_y are (x_rows, output_dim) and
     # (y_rows, output_dim) respectively.
-    output_x = math.sqrt(2.0 / output_dim) * rff_layer.apply(x)
-    output_y = math.sqrt(2.0 / output_dim) * rff_layer.apply(y)
+    output_x = math.sqrt(2.0 / output_dim) * rff_layer(x)
+    output_y = math.sqrt(2.0 / output_dim) * rff_layer(y)
 
     approx_kernel_matrix = kernelized_utils.inner_product(output_x, output_y)
     exact_kernel_matrix = exact_kernel_fn(x, y)

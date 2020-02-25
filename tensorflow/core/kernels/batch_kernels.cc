@@ -28,7 +28,9 @@ limitations under the License.
 #include "tensorflow/core/lib/gtl/cleanup.h"
 #include "tensorflow/core/lib/random/random.h"
 #include "tensorflow/core/platform/context.h"
+#include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/macros.h"
+#include "tensorflow/core/util/ptr_util.h"
 
 namespace tensorflow {
 
@@ -43,7 +45,7 @@ typedef Eigen::SyclDevice SYCLDevice;
 // op's output at position 'output_index', using 'context' for the allocation to
 // ensure proper device placement.
 template <typename T>
-Status Concat(OpKernelContext* context, const gtl::ArraySlice<Tensor>& inputs,
+Status Concat(OpKernelContext* context, const gtl::ArraySlice<Tensor> inputs,
               Tensor* output) {
   const int input_dims = inputs[0].dims();
   const TensorShape& input_shape = inputs[0].shape();
@@ -83,7 +85,8 @@ Status Concat(OpKernelContext* context, const gtl::ArraySlice<Tensor>& inputs,
       context->allocate_temp(DataTypeToEnum<T>::value, output_shape, output));
   if (output->NumElements() > 0) {
     auto output_flat = output->shaped<T, 2>({1, output->NumElements()});
-#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
+    (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
     if (std::is_same<Device, GPUDevice>::value) {
       ConcatGPU<T>(context, inputs_flat, output, &output_flat);
       return Status::OK();
@@ -104,7 +107,7 @@ Status Concat(OpKernelContext* context, const gtl::ArraySlice<Tensor>& inputs,
 // applicable special case and wrote to the outputs. Otherwise acts as a no-op.
 template <typename T>
 Status SplitEasyCases(OpKernelContext* context, const Tensor& input,
-                      const gtl::ArraySlice<int64>& sizes,
+                      const gtl::ArraySlice<int64> sizes,
                       std::vector<Tensor>* outputs, bool* done) {
   *done = false;
 
@@ -141,7 +144,7 @@ Status SplitEasyCases(OpKernelContext* context, const Tensor& input,
 // Handles the general case, on CPU.
 template <typename T>
 Status SplitCPU(OpKernelContext* context, const Tensor& input,
-                const gtl::ArraySlice<int64>& sizes,
+                const gtl::ArraySlice<int64> sizes,
                 std::vector<Tensor>* outputs) {
   int64 suffix_dim_size = 1;
   for (int i = 1; i < input.shape().dims(); ++i) {
@@ -173,7 +176,8 @@ Status SplitCPU(OpKernelContext* context, const Tensor& input,
   return Status::OK();
 }
 
-#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
+    (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
 
 // Handles the general case, on GPU.
 template <typename T>
@@ -189,8 +193,7 @@ Status SplitGPU(OpKernelContext* context, const Tensor& input,
 // The outer function that dispatches to the various Split*() functions above.
 template <typename T>
 Status Split(OpKernelContext* context, const Tensor& input,
-             const gtl::ArraySlice<int64>& sizes,
-             std::vector<Tensor>* outputs) {
+             const gtl::ArraySlice<int64> sizes, std::vector<Tensor>* outputs) {
   bool easy_cases_done;
   TF_RETURN_IF_ERROR(
       SplitEasyCases<T>(context, input, sizes, outputs, &easy_cases_done));
@@ -198,7 +201,8 @@ Status Split(OpKernelContext* context, const Tensor& input,
     return Status::OK();
   }
 
-#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
+    (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
 // TODO(olston, apassos): Handle non-CPU cases.
 // return SplitGPU<T>(context, input, sizes, outputs);
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
@@ -241,13 +245,13 @@ class BatchResource : public ResourceBase {
   Status RegisterInput(int64 guid, OpKernelContext* context,
                        const string& batcher_queue_name,
                        AsyncOpKernel::DoneCallback done_callback) {
-    std::unique_ptr<BatchTask> batch_components(new BatchTask);
+    auto batch_components = MakeUnique<BatchTask>();
     batch_components->guid = guid;
     batch_components->propagated_context = Context(ContextKind::kThread);
     OpInputList tensors;
     TF_RETURN_IF_ERROR(context->input_list("in_tensors", &tensors));
-    for (int i = 0; i < tensors.size(); ++i) {
-      const Tensor& tensor = tensors[i];
+    batch_components->inputs.reserve(tensors.size());
+    for (const Tensor& tensor : tensors) {
       if (tensor.shape().dims() == 0) {
         return errors::InvalidArgument(
             "Batching input tensors must have at least one dimension");
@@ -264,6 +268,7 @@ class BatchResource : public ResourceBase {
     const auto captured_status =
         context->input_list("captured_tensors", &captured_tensors);
     if (captured_status.ok()) {
+      batch_components->captured_inputs.reserve(captured_tensors.size());
       for (const Tensor& captured_tensor : captured_tensors) {
         batch_components->captured_inputs.push_back(captured_tensor);
       }
@@ -358,28 +363,16 @@ class BatchResource : public ResourceBase {
       if (padding_amount > 0) {
         const Tensor& padding_source = batch.task(0).inputs.at(i);
         Tensor padding;
+        if (padding_source.shape().dim_size(0) == 0) {
+          return errors::InvalidArgument(
+              "Cannot use an empty tensor with zero rows as padding when "
+              "batching. (Input ",
+              i, " got shape ", padding_source.shape().DebugString(), ".)");
+        }
         if (padding_source.shape().dim_size(0) == 1) {
           padding = padding_source;
         } else {
-          const std::vector<int64> slice_sizes = {1};
-          const DataType type = padding_source.dtype();
-          Status slice_status;
-          std::vector<Tensor> slices;
-          switch (type) {
-#define CASE(type)                                                     \
-  case DataTypeToEnum<type>::value:                                    \
-    slice_status =                                                     \
-        SplitCPU<type>(context, padding_source, slice_sizes, &slices); \
-    break;
-            TF_CALL_ALL_TYPES(CASE);
-#undef CASE
-            default:
-              slice_status =
-                  errors::InvalidArgument("Unsupported data type: ", type);
-              break;
-          }
-          TF_RETURN_IF_ERROR(slice_status);
-          padding = slices.at(0);
+          padding = padding_source.Slice(0, 1);
         }
         for (int i = 0; i < padding_amount; ++i) {
           to_concatenate.push_back(padding);
@@ -517,7 +510,6 @@ class BatchResource : public ResourceBase {
       return;
     }
     FunctionLibraryRuntime::Options opts;
-    opts.step_id = last_task_context->step_id();
     opts.step_container = last_task_context->step_container();
     opts.cancellation_manager = last_task_context->cancellation_manager();
     opts.stats_collector = last_task_context->stats_collector();
